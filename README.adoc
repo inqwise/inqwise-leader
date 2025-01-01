@@ -1,0 +1,50 @@
+= Inqwise-Leader
+
+Leader Election for Vert.x Clusters using the Raft Consensus Algorithm
+
+== Purpose
+
+The Inqwise-Leader project provides an implementation of leader election for Vert.x clusters using the Raft Consensus Algorithm.
+It ensures consistent and reliable leader election in distributed environments, enabling scenarios where exactly one node in the cluster must perform scheduled or critical operations.
+
+== Use Cases
+	•	Running exactly one scheduled process in a Vert.x cluster.
+	•	Ensuring singleton resource access across cluster nodes.
+	•	Coordinating cluster-wide tasks reliably.
+	•	Maintaining failover resilience when a leader node goes offline.
+
+== How It Works
+
+The implementation follows the principles of the Raft Consensus Algorithm (Raft Website):
+	1.	Leader Election: Nodes in the Vert.x cluster elect one node as the leader.
+	2.	Log Replication: The leader communicates tasks or commands to follower nodes.
+	3.	Consistency and Fault Tolerance: Ensures cluster reliability and consistency even during node failures.
+
+== Key Features
+	•	Reliable Leader Election: Guarantees that only one node acts as a leader at any time.
+	•	Automatic Failover: Seamless recovery when the leader node fails.
+	•	Lightweight Integration: Optimized for use in Vert.x applications.
+	•	Extensible Design: Easily adapt to various cluster architectures.
+
+== Installation
+
+Add the dependency to your project:
+
+[source,xml,subs="attributes+"]
+----
+<dependency>
+  <groupId>com.inqwise</groupId>
+  <artifactId>inqwise-leader</artifactId>
+  <version>1.0.0</version>
+</dependency>
+----
+
+== Acknowledgments
+
+This project is inspired by the Raft Consensus Algorithm and its proven reliability in distributed systems.
+
+== License
+
+This project is licensed under the MIT License.
+
+For more details and contributions, visit our repository and raise an issue or pull request.
