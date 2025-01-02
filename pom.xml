@@ -67,16 +67,6 @@
 			<scope>provided</scope>
 		</dependency>
 		<dependency>
-			<groupId>com.inqwise</groupId>
-			<artifactId>inqwise-errors</artifactId>
-			<version>1.0.0</version>
-		</dependency>
-		<dependency>
-			<groupId>commons-io</groupId>
-			<artifactId>commons-io</artifactId>
-			<version>2.16.1</version>
-		</dependency>
-		<dependency>
 			<groupId>org.apache.logging.log4j</groupId>
 			<artifactId>log4j-core</artifactId>
 			<scope>provided</scope>
@@ -101,6 +91,7 @@
 			<artifactId>junit-jupiter-params</artifactId>
 			<scope>test</scope>
 		</dependency>
+		
 	</dependencies>
 	
 	<dependencyManagement>

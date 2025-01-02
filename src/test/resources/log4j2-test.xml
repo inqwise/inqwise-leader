@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN">
+	<Appenders>
+		<Console name="Console" target="SYSTEM_OUT" follow="true">
+			<PatternLayout>
+				<pattern>%level{length=1} %d{HH:mm:ss.SSS}[%-26t]%c{...9} - %enc{%msg}{CRLF} %replace{%ex}{[\r\n]{1,2}}{|}%n%throwable</pattern>
+			</PatternLayout>
+		</Console>
+	</Appenders>
+	<Loggers>
+		<Logger name="io.netty" level="warn" additivity="false">
+			<AppenderRef ref="Console"/>
+		</Logger>
+		<Logger name="com.mchange" level="warn" additivity="false">
+			<AppenderRef ref="Console"/>
+		</Logger>
+		<Root level="all">
+			<AppenderRef ref="Console"/>
+		</Root>
+	</Loggers>
+</Configuration>
