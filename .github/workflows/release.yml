@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version"
+        required: true
+        type: string
+
+jobs:
+  release:
+    name: Release to Maven Central
+    runs-on: ubuntu-latest
+    if: github.repository == 'inqwise/inqwise-leader'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: "temurin"
+          cache: maven
+          server-id: sonatype-oss-release
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Configure Git user
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+
+      - name: Build and test
+        run: mvn clean test
+
+      - name: Maven Release (Manual Trigger)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          NEXT_VERSION=$(echo ${{ github.event.inputs.version }} | awk -F. '{$NF = $NF + 1; print}' OFS=.)
+          mvn release:clean release:prepare release:perform \
+            -DreleaseVersion=${{ github.event.inputs.version }} \
+            -DdevelopmentVersion=${NEXT_VERSION}-SNAPSHOT \
+            -Dtag=v${{ github.event.inputs.version }} \
+            -DskipTests \
+            -Darguments="-Dmaven.deploy.skip=true -DskipTests"
+        env:
+          MAVEN_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Deploy to Maven Central
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+        run: |
+          VERSION_INPUT="${{ github.event.inputs.version }}"
+          if [ "${VERSION_INPUT}" = "" ]; then
+            # Extract version from the tag name when triggered by release event
+            VERSION_INPUT="${{ github.ref_name }}"
+            VERSION_INPUT="${VERSION_INPUT#v}"
+          fi
+          git checkout -f "v${VERSION_INPUT}"
+          mvn clean deploy -P sonatype-oss-release -Dmaven.deploy.skip=true -DskipTests -DreleaseVersion="$VERSION_INPUT"
+        env:
+          MAVEN_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Prepare Release Assets
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+        run: |
+          # The Maven release process already built the correct artifacts
+          # We need to find them in the Maven local repository after release:perform
+          VERSION="${{ github.event.inputs.version }}"
+          if [ "$VERSION" = "" ]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"
+          fi
+          git checkout -f "v$VERSION"
+          MAVEN_REPO="$HOME/.m2/repository/com/inqwise/inqwise-leader/$VERSION"
+
+          mkdir -p release-assets
+
+          # Copy the release artifacts from Maven local repository
+          if [ -d "$MAVEN_REPO" ]; then
+            cp "$MAVEN_REPO/inqwise-leader-$VERSION.jar" release-assets/ || echo "Main JAR not found"
+            cp "$MAVEN_REPO/inqwise-leader-$VERSION-sources.jar" release-assets/ || echo "Sources JAR not found"
+            cp "$MAVEN_REPO/inqwise-leader-$VERSION-javadoc.jar" release-assets/ || echo "Javadoc JAR not found"
+          else
+            echo "Maven repository directory not found: $MAVEN_REPO"
+            echo "Falling back to building artifacts with correct version"
+            # Checkout the release tag to build the correct version
+            git checkout "v$VERSION"
+            mvn clean package -P sonatype-oss-release -DskipTests
+            cp target/inqwise-leader-*.jar release-assets/
+          fi
+
+          # List what we actually have
+          echo "Release assets prepared:"
+          ls -la release-assets/
+        env:
+          MAVEN_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Create GitHub Release (Manual Trigger)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.event.inputs.version }}
+          name: Release v${{ github.event.inputs.version }}
+          body: |
+            🚀 **Release v${{ github.event.inputs.version }}**
+
+            ## 📦 Maven Central
+            ```xml
+            <dependency>
+                <groupId>com.inqwise</groupId>
+                <artifactId>inqwise-leader</artifactId>
+                <version>${{ github.event.inputs.version }}</version>
+            </dependency>
+            ```
+
+            ## 📋 Release Assets
+            - Main library JAR
+            - Sources JAR
+            - Javadoc JAR
+            - All artifacts GPG signed
+
+            ## 🔗 Links
+            - [Maven Central](https://central.sonatype.com/artifact/com.inqwise/inqwise-leader/${{ github.event.inputs.version }})
+            - [Documentation](https://github.com/inqwise/inqwise-leader#readme)
+
+            ---
+            *Released automatically via GitHub Actions*
+          files: release-assets/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Assets (Existing Release)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          overwrite: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
