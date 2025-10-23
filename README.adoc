@@ -1,3 +1,12 @@
+image:https://github.com/inqwise/inqwise-leader/actions/workflows/ci.yml/badge.svg[CI, link=https://github.com/inqwise/inqwise-leader/actions/workflows/ci.yml]
+image:https://github.com/inqwise/inqwise-leader/actions/workflows/release.yml/badge.svg[Release, link=https://github.com/inqwise/inqwise-leader/actions/workflows/release.yml]
+image:https://github.com/inqwise/inqwise-leader/actions/workflows/codeql.yml/badge.svg[CodeQL, link=https://github.com/inqwise/inqwise-leader/actions/workflows/codeql.yml]
+image:https://codecov.io/gh/inqwise/inqwise-leader/branch/main/graph/badge.svg[Codecov, link=https://codecov.io/gh/inqwise/inqwise-leader]
+image:https://snyk.io/test/github/inqwise/inqwise-leader/badge.svg[Snyk Security, link=https://snyk.io/test/github/inqwise/inqwise-leader]
+image:https://img.shields.io/maven-central/v/com.inqwise/inqwise-leader.svg?label=Maven%20Central[Maven Central, link=https://search.maven.org/search?q=g:%22com.inqwise%22%20AND%20a:%22inqwise-leader%22]
+image:https://img.shields.io/badge/License-MIT-yellow.svg[License: MIT, link=https://opensource.org/licenses/MIT]
+image:https://img.shields.io/badge/Java-21%2B-blue.svg[Java Version, link=https://openjdk.java.net/projects/jdk/21/]
+
 = Inqwise-Leader
 
 Leader Election for Vert.x Clusters using the Raft Consensus Algorithm
