@@ -52,7 +52,7 @@
 		<maven.gpg.plugin.version>1.6</maven.gpg.plugin.version>
 		<maven.javadoc.plugin.version>3.5.0</maven.javadoc.plugin.version>
 
-		<log4j2.version>2.22.1</log4j2.version>
+		<log4j2.version>2.25.2</log4j2.version>
 		<vertx.version>5.0.4</vertx.version>
 		<jacoco.plugin.version>0.8.11</jacoco.plugin.version>
     </properties>
