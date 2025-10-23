@@ -1,0 +1,128 @@
+name: Snyk Security
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  schedule:
+    # Run monthly on the 1st at 8:00 AM UTC (free tier limit)
+    - cron: "0 8 1 * *"
+  workflow_dispatch:
+
+jobs:
+  snyk-info:
+    name: Snyk Configuration Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Snyk Token and provide info
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "ℹ️ Snyk security scanning is not configured."
+            echo "To enable Snyk scanning, add SNYK_TOKEN to repository secrets."
+            echo "Visit https://snyk.io to get your token."
+            echo "This is optional - the build will continue without security scanning."
+          else
+            echo "✅ Snyk token is configured. Security scanning will run on appropriate triggers."
+          fi
+
+  snyk:
+    name: Snyk Security Scan
+    runs-on: ubuntu-latest
+    # Run on PR, releases, and monthly schedule (free tier optimized)
+    if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: "temurin"
+          cache: maven
+
+      - name: Build project
+        run: mvn clean compile -DskipTests
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/maven@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --sarif-file-output=snyk.sarif
+
+      - name: Upload Snyk results to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('snyk.sarif') != ''
+        with:
+          sarif_file: snyk.sarif
+
+  snyk-monitor:
+    name: Snyk Monitor
+    runs-on: ubuntu-latest
+    # Only monitor on tags/releases to conserve free tier usage
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: "temurin"
+          cache: maven
+
+      - name: Build project
+        run: mvn clean compile -DskipTests
+
+      - name: Run Snyk monitor
+        uses: snyk/actions/maven@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: monitor
+          args: --project-name=inqwise-leader
+
+  snyk-container:
+    name: Snyk Container Scan
+    runs-on: ubuntu-latest
+    # Only run on releases and manual dispatch to conserve free tier
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: "temurin"
+          cache: maven
+
+      - name: Build JAR
+        run: mvn clean package -DskipTests
+
+      - name: Build Docker image for scanning
+        run: |
+          cat > Dockerfile.scan << EOF
+          FROM eclipse-temurin:21-jre-alpine
+          COPY target/inqwise-leader-*.jar app.jar
+          ENTRYPOINT ["java","-jar","/app.jar"]
+          EOF
+          docker build -f Dockerfile.scan -t inqwise-leader:scan .
+
+      - name: Run Snyk to check Docker image for vulnerabilities
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: inqwise-leader:scan
+          args: --severity-threshold=high

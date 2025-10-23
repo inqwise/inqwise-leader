@@ -1,10 +1,13 @@
 package com.inqwise.leader;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -14,6 +17,9 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.DeploymentOptions;
 import io.vertx.core.Vertx;
+import io.vertx.core.json.JsonObject;
+import io.vertx.core.shareddata.Lock;
+import io.vertx.junit5.Checkpoint;
 import io.vertx.junit5.VertxExtension;
 import io.vertx.junit5.VertxTestContext;
 
@@ -145,6 +151,123 @@ class LeaderConsensusTest {
 				l2.stop();
 			}
 		}, new DeploymentOptions());		
+	}
+
+	@Test
+	@DisplayName("public constructor creates random id and stop releases resources")
+	void testPublicConstructorAndStop(Vertx vertx, VertxTestContext context) throws Exception {
+		var options = LeaderConsensusOptions.builder().withLeaderCycleMsgTime(50L).withPendingToLeaderMsgTime(50L).build();
+		LeaderConsensus consensus = new LeaderConsensus("cleanup_group", vertx, options);
+
+		Field idField = LeaderConsensus.class.getDeclaredField("id");
+		idField.setAccessible(true);
+		String generatedId = (String) idField.get(consensus);
+		context.verify(() -> Assertions.assertNotNull(generatedId));
+
+		LeaderConsensus.Keys keys = consensus.new Keys();
+		context.verify(() -> Assertions.assertNotNull(keys));
+
+		RecordingLock lock = new RecordingLock();
+		setField(consensus, "leaderLock", lock);
+		setField(consensus, "leader", true);
+
+		invoke(consensus, "startPendingToLeaderMsgTimer");
+		invoke(consensus, "startPendingToLeaderMsgTimer");
+		invoke(consensus, "startLeaderCycleMsgTimer");
+		invoke(consensus, "startLeaderCycleMsgTimer");
+
+		Long releaseTimer = vertx.setTimer(1000, id -> {});
+		setField(consensus, "releaseLockApproveTimoutTimerId", releaseTimer);
+
+		consensus.stop();
+
+		context.verify(() -> {
+			Assertions.assertFalse((Boolean) getField(consensus, "leader"));
+			Assertions.assertTrue(lock.released.get());
+			Assertions.assertNull(getField(consensus, "consumer"));
+			Assertions.assertNull(getField(consensus, "privateConsumer"));
+		});
+
+		vertx.setTimer(20, id -> context.completeNow());
+	}
+
+	@Test
+	@DisplayName("refusal messages demote leader and reset counters")
+	void testRefusalFlow(Vertx vertx, VertxTestContext context) throws Exception {
+		var options = LeaderConsensusOptions.builder().withLeaderCycleMsgTime(40L).withPendingToLeaderMsgTime(40L).build();
+		LeaderConsensus leaderConsensus = new LeaderConsensus(GROUP, vertx, options, "refusal-node");
+		setField(leaderConsensus, "leader", true);
+		setField(leaderConsensus, "onLeaderChange", (Consumer<Boolean>) value -> {});
+
+		Checkpoint refusalSent = context.checkpoint();
+		Checkpoint refusalHandled = context.checkpoint();
+
+		vertx.eventBus().consumer(GROUP + ".competitor", msg -> context.verify(() -> {
+			JsonObject body = (JsonObject) msg.body();
+			Assertions.assertFalse(body.getBoolean(LeaderConsensus.Keys.IS_ACKNOLEDGE));
+			refusalSent.flag();
+		}));
+
+		leaderConsensus.start();
+
+		vertx.setTimer(30, id -> {
+			try {
+				Long timerId = vertx.setTimer(1000, ignore -> {});
+				setField(leaderConsensus, "releaseLockApproveTimoutTimerId", timerId);
+				setField(leaderConsensus, "validateLeadingTimerId", vertx.setTimer(1000, ignore -> {}));
+				RecordingLock lock = new RecordingLock();
+				setField(leaderConsensus, "leaderLock", lock);
+				setField(leaderConsensus, "isPending", false);
+
+				JsonObject competitorClaim = new JsonObject()
+					.put(LeaderConsensus.Keys.ADDRESS_UUID, "competitor")
+					.put(LeaderConsensus.Keys.IS_LEADER, true);
+				vertx.eventBus().publish(GROUP, competitorClaim);
+
+				JsonObject refusal = new JsonObject()
+					.put(LeaderConsensus.Keys.ADDRESS_UUID, "competitor")
+					.put(LeaderConsensus.Keys.IS_LEADER, true)
+					.put(LeaderConsensus.Keys.IS_ACKNOLEDGE, false);
+				vertx.eventBus().send(GROUP + ".refusal-node", refusal);
+
+				vertx.setTimer(80, done -> context.verify(() -> {
+					Assertions.assertFalse(leaderConsensus.getIsLeader());
+					Assertions.assertEquals(0, leaderConsensus.getApprovalCounter());
+					Assertions.assertEquals(0, leaderConsensus.getRefusalCounter());
+					Assertions.assertTrue(lock.released.get());
+					refusalHandled.flag();
+				}));
+			} catch (Exception e) {
+				context.failNow(e);
+			}
+		});
+	}
+
+	private static Object getField(LeaderConsensus consensus, String name) throws Exception {
+		Field field = LeaderConsensus.class.getDeclaredField(name);
+		field.setAccessible(true);
+		return field.get(consensus);
+	}
+
+	private static void setField(LeaderConsensus consensus, String name, Object value) throws Exception {
+		Field field = LeaderConsensus.class.getDeclaredField(name);
+		field.setAccessible(true);
+		field.set(consensus, value);
+	}
+
+	private static void invoke(LeaderConsensus consensus, String name) throws Exception {
+		Method method = LeaderConsensus.class.getDeclaredMethod(name);
+		method.setAccessible(true);
+		method.invoke(consensus);
+	}
+
+	private static final class RecordingLock implements Lock {
+		private final AtomicBoolean released = new AtomicBoolean(false);
+
+		@Override
+		public void release() {
+			released.set(true);
+		}
 	}
 
 }
