@@ -44,7 +44,7 @@ Add the dependency to your project:
 <dependency>
   <groupId>com.inqwise</groupId>
   <artifactId>inqwise-leader</artifactId>
-  <version>1.0.0</version>
+  <version>${latest.version}</version>
 </dependency>
 ----
 
