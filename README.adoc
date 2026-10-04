@@ -1,3 +1,5 @@
+= Inqwise-Leader
+
 image:https://github.com/inqwise/inqwise-leader/actions/workflows/ci.yml/badge.svg[CI, link=https://github.com/inqwise/inqwise-leader/actions/workflows/ci.yml]
 image:https://github.com/inqwise/inqwise-leader/actions/workflows/release.yml/badge.svg[Release, link=https://github.com/inqwise/inqwise-leader/actions/workflows/release.yml]
 image:https://github.com/inqwise/inqwise-leader/actions/workflows/codeql.yml/badge.svg[CodeQL, link=https://github.com/inqwise/inqwise-leader/actions/workflows/codeql.yml]
@@ -7,8 +9,6 @@ image:https://img.shields.io/maven-central/v/com.inqwise/inqwise-leader.svg?labe
 image:https://img.shields.io/badge/License-MIT-yellow.svg[License: MIT, link=https://opensource.org/licenses/MIT]
 image:https://img.shields.io/badge/Java-21%2B-blue.svg[Java Version, link=https://openjdk.java.net/projects/jdk/21/]
 
-= Inqwise-Leader
-
 Leader Election for Vert.x Clusters using the Raft Consensus Algorithm
 
 == Purpose
@@ -17,23 +17,26 @@ The Inqwise-Leader project provides an implementation of leader election for Ver
 It ensures consistent and reliable leader election in distributed environments, enabling scenarios where exactly one node in the cluster must perform scheduled or critical operations.
 
 == Use Cases
-	•	Running exactly one scheduled process in a Vert.x cluster.
-	•	Ensuring singleton resource access across cluster nodes.
-	•	Coordinating cluster-wide tasks reliably.
-	•	Maintaining failover resilience when a leader node goes offline.
+
+* Running exactly one scheduled process in a Vert.x cluster.
+* Ensuring singleton resource access across cluster nodes.
+* Coordinating cluster-wide tasks reliably.
+* Maintaining failover resilience when a leader node goes offline.
 
 == How It Works
 
-The implementation follows the principles of the Raft Consensus Algorithm (Raft Website):
-	1.	Leader Election: Nodes in the Vert.x cluster elect one node as the leader.
-	2.	Log Replication: The leader communicates tasks or commands to follower nodes.
-	3.	Consistency and Fault Tolerance: Ensures cluster reliability and consistency even during node failures.
+The implementation follows the principles of the Raft Consensus Algorithm (https://raft.github.io/[Raft Website]):
+
+. Leader Election: Nodes in the Vert.x cluster elect one node as the leader.
+. Log Replication: The leader communicates tasks or commands to follower nodes.
+. Consistency and Fault Tolerance: Ensures cluster reliability and consistency even during node failures.
 
 == Key Features
-	•	Reliable Leader Election: Guarantees that only one node acts as a leader at any time.
-	•	Automatic Failover: Seamless recovery when the leader node fails.
-	•	Lightweight Integration: Optimized for use in Vert.x applications.
-	•	Extensible Design: Easily adapt to various cluster architectures.
+
+* Reliable Leader Election: Guarantees that only one node acts as a leader at any time.
+* Automatic Failover: Seamless recovery when the leader node fails.
+* Lightweight Integration: Optimized for use in Vert.x applications.
+* Extensible Design: Easily adapt to various cluster architectures.
 
 == Installation
 
@@ -47,6 +50,65 @@ Add the dependency to your project:
   <version>${latest.version}</version>
 </dependency>
 ----
+
+== Quick Start
+
+Create a verticle that starts a periodic job when it becomes leader and cancels the job when leadership is lost:
+
+[source,java]
+----
+import com.inqwise.leader.LeaderConsensus;
+import com.inqwise.leader.LeaderConsensusOptions;
+import io.vertx.core.AbstractVerticle;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+public class LeaderWorker extends AbstractVerticle {
+	private static final Logger logger = LogManager.getLogger(LeaderWorker.class);
+	private LeaderConsensus consensus;
+	private Long jobTimerId;
+
+	@Override
+	public void start() {
+		consensus = new LeaderConsensus("scheduled-job", vertx, new LeaderConsensusOptions());
+		consensus.onLeaderChange(isLeader -> {
+			if (isLeader) {
+				jobTimerId = vertx.setPeriodic(5000, timerId -> {
+					logger.info("Running the scheduled job as leader");
+					// Run your asynchronous job here.
+				});
+			} else if (jobTimerId != null) {
+				vertx.cancelTimer(jobTimerId);
+				jobTimerId = null;
+			}
+		});
+		consensus.start();
+	}
+
+	@Override
+	public void stop() {
+		if (consensus != null) {
+			consensus.stop();
+		}
+	}
+}
+----
+
+Deploy it using your application's Vert.x instance:
+
+[source,java]
+----
+vertx.deployVerticle(new LeaderWorker());
+----
+
+For a local trial, use `Vertx.vertx()` to create the instance.
+For election across processes, deploy this verticle on each node using a clustered Vert.x instance and a configured cluster manager.
+Use the same group name (`scheduled-job`) on every participating node.
+Your application must supply Vert.x and a Log4j runtime; this library declares those runtime dependencies as provided.
+
+The default election timeout is 2500 ms and the leader heartbeat interval is 1000 ms.
+Register the leadership callback before calling `start()` and call `stop()` when the verticle is undeployed.
+Keep callback and timer handlers nonblocking. Canceling the timer prevents future job runs; it does not cancel a job already in progress.
 
 == Acknowledgments
 
