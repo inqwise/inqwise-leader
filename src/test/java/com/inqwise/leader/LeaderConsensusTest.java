@@ -4,7 +4,6 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -186,6 +185,9 @@ class LeaderConsensusTest {
 			Assertions.assertTrue(lock.released.get());
 			Assertions.assertNull(getField(consensus, "consumer"));
 			Assertions.assertNull(getField(consensus, "privateConsumer"));
+			Assertions.assertNull(getField(consensus, "pingLeadingTimerId"));
+			Assertions.assertNull(getField(consensus, "validateLeadingTimerId"));
+			Assertions.assertNull(getField(consensus, "releaseLockApproveTimoutTimerId"));
 		});
 
 		vertx.setTimer(20, id -> context.completeNow());
@@ -197,10 +199,22 @@ class LeaderConsensusTest {
 		var options = LeaderConsensusOptions.builder().withLeaderCycleMsgTime(40L).withPendingToLeaderMsgTime(40L).build();
 		LeaderConsensus leaderConsensus = new LeaderConsensus(GROUP, vertx, options, "refusal-node");
 		setField(leaderConsensus, "leader", true);
-		setField(leaderConsensus, "onLeaderChange", (Consumer<Boolean>) value -> {});
 
 		Checkpoint refusalSent = context.checkpoint();
 		Checkpoint refusalHandled = context.checkpoint();
+		RecordingLock lock = new RecordingLock();
+		leaderConsensus.onLeaderChange(leader -> {
+			if (!leader) {
+				context.verify(() -> {
+					Assertions.assertFalse(leaderConsensus.getIsLeader());
+					Assertions.assertEquals(0, leaderConsensus.getApprovalCounter());
+					Assertions.assertEquals(0, leaderConsensus.getRefusalCounter());
+					Assertions.assertTrue(lock.released.get());
+					leaderConsensus.stop();
+					refusalHandled.flag();
+				});
+			}
+		});
 
 		vertx.eventBus().consumer(GROUP + ".competitor", msg -> context.verify(() -> {
 			JsonObject body = (JsonObject) msg.body();
@@ -215,7 +229,6 @@ class LeaderConsensusTest {
 				Long timerId = vertx.setTimer(1000, ignore -> {});
 				setField(leaderConsensus, "releaseLockApproveTimoutTimerId", timerId);
 				setField(leaderConsensus, "validateLeadingTimerId", vertx.setTimer(1000, ignore -> {}));
-				RecordingLock lock = new RecordingLock();
 				setField(leaderConsensus, "leaderLock", lock);
 				setField(leaderConsensus, "isPending", false);
 
@@ -230,13 +243,6 @@ class LeaderConsensusTest {
 					.put(LeaderConsensus.Keys.IS_ACKNOLEDGE, false);
 				vertx.eventBus().send(GROUP + ".refusal-node", refusal);
 
-				vertx.setTimer(80, done -> context.verify(() -> {
-					Assertions.assertFalse(leaderConsensus.getIsLeader());
-					Assertions.assertEquals(0, leaderConsensus.getApprovalCounter());
-					Assertions.assertEquals(0, leaderConsensus.getRefusalCounter());
-					Assertions.assertTrue(lock.released.get());
-					refusalHandled.flag();
-				}));
 			} catch (Exception e) {
 				context.failNow(e);
 			}

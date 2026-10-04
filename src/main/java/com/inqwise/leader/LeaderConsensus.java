@@ -41,6 +41,9 @@ public class LeaderConsensus {
 	private LeaderConsensusOptions options;
 	private boolean isPending;
 	private Long releaseLockApproveTimoutTimerId;
+	private boolean started;
+	private long lifecycleGeneration;
+	private long electionGeneration;
 	
 	public LeaderConsensus(String leaderConsensusGroupName, Vertx vertx, LeaderConsensusOptions options) {
 		this(leaderConsensusGroupName, vertx, options, null);
@@ -58,6 +61,11 @@ public class LeaderConsensus {
 	
 	public void start() {
 		logger.trace("start");
+		if (started) {
+			return;
+		}
+		started = true;
+		lifecycleGeneration++;
 		leaderConsensusLock();
 	}
 	
@@ -72,7 +80,11 @@ public class LeaderConsensus {
 	private void registerToMessageFromLeader() {
 		logger.debug("registerToMessageFromLeader id:{}, in group:{}", id, leaderConsensusGroupName);
 		consumer = eventBus.consumer(leaderConsensusGroupName);
+		long generation = lifecycleGeneration;
 		consumer.handler(msg -> {
+			if (!started || generation != lifecycleGeneration) {
+				return;
+			}
 			logger.trace("recieved leaderMsg for id:{}", id);
 			JsonObject msgBody = (JsonObject)msg.body();
 			logger.trace("uuid:{} got msg:{}", id, msgBody);
@@ -99,7 +111,11 @@ public class LeaderConsensus {
 	private void registerToPrivateMessage() {
 		logger.trace("registerToPrivateMessage id:{}, in group:{}", id, leaderConsensusGroupName);
 		privateConsumer = eventBus.consumer(combineStr(leaderConsensusGroupName, id));
+		long generation = lifecycleGeneration;
 		privateConsumer.handler(msg -> {
+			if (!started || generation != lifecycleGeneration) {
+				return;
+			}
 			logger.trace("recieved privateMsg for id:{}", id);
 			JsonObject msgBody = (JsonObject)msg.body();
 			logger.trace("uuid:{} got msg:{}", id, msgBody);
@@ -109,6 +125,7 @@ public class LeaderConsensus {
 			
 			if (null != releaseLockApproveTimoutTimerId){
 				vertx.cancelTimer(releaseLockApproveTimoutTimerId);
+				releaseLockApproveTimoutTimerId = null;
 			}
 			releaseLock();
 			
@@ -117,12 +134,11 @@ public class LeaderConsensus {
 			} else {
 				refusalCounter++;
 				if(leader) {
-					//cancel leadership
-					changeLeader(false);
 					//cancel leaderTimer
 					stopLeaderCycleMsgTimer();
 					//wait for leader msg
 					startPendingToLeaderMsgTimer();
+					changeLeader(false);
 				}
 			}
 		});
@@ -131,24 +147,37 @@ public class LeaderConsensus {
 	
 	private void publishNewLeader() {
 		logger.debug("publishNewLeader uuid:{}", id);
+		long generation = electionGeneration;
 		vertx.sharedData().getLock(leaderConsensusGroupName).map(l -> {
 			
-			if(isPending) {
+			if(!started || generation != electionGeneration || isPending) {
 				logger.debug("id:{} is pending", id);
 				l.release();
 			} else {
 				leaderLock = l;
+				changeLeader(true);
+				// A leadership callback may stop or restart this instance.
+				if (!started || generation != electionGeneration || !leader) {
+					return null;
+				}
 				startLeaderCycleMsgTimer();
 				publishLeader();
 				releaseLockApproveTimoutTimerId = vertx.setTimer(options.getValidateLeadingTimer(), timerId-> {
+					if (!started || generation != electionGeneration || leaderLock != l) {
+						return;
+					}
+					releaseLockApproveTimoutTimerId = null;
 					logger.debug("releasing without acknoledge id {}", id);
 					releaseLock();
 				});
 			}
 			return null;
 		}).onFailure(e -> {
-			if(!isPending) {
+			if(started && generation == electionGeneration && !isPending) {
+				releaseLock();
+				stopLeaderCycleMsgTimer();
 				startPendingToLeaderMsgTimer();
+				changeLeader(false);
 			}
 		});
 		
@@ -185,7 +214,7 @@ public class LeaderConsensus {
 	}
 	
 	private final void validateLeadingTimerAction(long id) {
-		if(null != consumer) {
+		if(started && leader && Objects.equals(validateLeadingTimerId, id)) {
 			publishLeader();
 			validateLeadingTimerId = vertx.setTimer(options.getValidateLeadingTimer(), this::validateLeadingTimerAction);
 		}
@@ -205,12 +234,12 @@ public class LeaderConsensus {
 		logger.debug("stopLeaderCycleMsgTimer id:{}, for group:{}", id, leaderConsensusGroupName);
 		if(null != validateLeadingTimerId) {
 			vertx.cancelTimer(validateLeadingTimerId.longValue());
+			validateLeadingTimerId = null;
 		}
 	}
 	
 	private final void pingLeadingTimerAction(long id) {
-		if(null != consumer) {
-			changeLeader(true);
+		if(started && Objects.equals(pingLeadingTimerId, id)) {
 			stopPendingToLeaderMsgTimer();
 			publishNewLeader();
 		}
@@ -218,6 +247,7 @@ public class LeaderConsensus {
 	
 	private void startPendingToLeaderMsgTimer() {
 		logger.trace("startPendingToLeaderMsgTimer id:{}, for group:{}", id, leaderConsensusGroupName);
+		electionGeneration++;
 		isPending = true;
 		if(null == pingLeadingTimerId) {
 			pingLeadingTimerId = vertx.setTimer(options.getPingLeadingTimer(), this::pingLeadingTimerAction);
@@ -231,12 +261,17 @@ public class LeaderConsensus {
 		logger.trace("stopPendingToLeaderMsgTimer id:{}, for group:{}", id, leaderConsensusGroupName);
 		if(null != pingLeadingTimerId) {
 			vertx.cancelTimer(pingLeadingTimerId.longValue());
+			pingLeadingTimerId = null;
 		}
 		isPending = false;
 	}
 	
 	public void stop() {
 		logger.trace("stop");
+		started = false;
+		lifecycleGeneration++;
+		electionGeneration++;
+		isPending = false;
 		if(null != consumer) {
 			consumer.unregister();
 			consumer = null;
@@ -245,10 +280,11 @@ public class LeaderConsensus {
 			privateConsumer.unregister();
 			privateConsumer = null;
 		}
-		if(null != leaderLock) {
-			leaderLock.release();
-			leaderLock = null;
+		if(null != releaseLockApproveTimoutTimerId) {
+			vertx.cancelTimer(releaseLockApproveTimoutTimerId);
+			releaseLockApproveTimoutTimerId = null;
 		}
+		releaseLock();
 		if(null != pingLeadingTimerId) {
 			vertx.cancelTimer(pingLeadingTimerId.longValue());
 			pingLeadingTimerId = null;
@@ -259,9 +295,7 @@ public class LeaderConsensus {
 			validateLeadingTimerId = null;
 		}
 		
-		if(leader) {
-			leader = false;
-		}
+		changeLeader(false);
 	}
 	
 	private void changeLeader(boolean leader) {

@@ -1,5 +1,7 @@
 package com.inqwise.leader;
 
+import java.util.Objects;
+
 import io.vertx.core.json.JsonObject;
 
 public class LeaderConsensusOptions {
@@ -7,15 +9,15 @@ public class LeaderConsensusOptions {
 		public static final String PENDING_TO_LEADER_MSG_TIME = "pending_to_leader_msg_time";
 		public static final String LEADER_CYCLE_MSG_TIME = "leader_cycle_msg_time";
 	}
-	private static long DEFAULT_PENDING_TO_LEADER_MSG_TIME = 2500;
-	private static long DEFAULT_LEADER_CYCLE_MSG_TIME = 1000;
+	private static final long DEFAULT_PENDING_TO_LEADER_MSG_TIME = 2500;
+	private static final long DEFAULT_LEADER_CYCLE_MSG_TIME = 1000;
 	
 	private	Long pendingToLeaderMsgTime;
 	private Long leaderCycleMsgTime;
 
 	private LeaderConsensusOptions(Builder builder) {
-		this.pendingToLeaderMsgTime = builder.pendingToLeaderMsgTime;
-		this.leaderCycleMsgTime = builder.leaderCycleMsgTime;
+		this.pendingToLeaderMsgTime = validateTimer(builder.pendingToLeaderMsgTime, Keys.PENDING_TO_LEADER_MSG_TIME);
+		this.leaderCycleMsgTime = validateTimer(builder.leaderCycleMsgTime, Keys.LEADER_CYCLE_MSG_TIME);
 	}
 
 	public LeaderConsensusOptions() {
@@ -24,8 +26,19 @@ public class LeaderConsensusOptions {
 	}
 	
 	public LeaderConsensusOptions(JsonObject json) {
-		this.pendingToLeaderMsgTime = json.getLong(Keys.PENDING_TO_LEADER_MSG_TIME, DEFAULT_PENDING_TO_LEADER_MSG_TIME);
-		this.leaderCycleMsgTime = json.getLong(Keys.LEADER_CYCLE_MSG_TIME, DEFAULT_LEADER_CYCLE_MSG_TIME);
+		Objects.requireNonNull(json, "json");
+		this.pendingToLeaderMsgTime = validateTimer(
+			json.getLong(Keys.PENDING_TO_LEADER_MSG_TIME, DEFAULT_PENDING_TO_LEADER_MSG_TIME), Keys.PENDING_TO_LEADER_MSG_TIME);
+		this.leaderCycleMsgTime = validateTimer(
+			json.getLong(Keys.LEADER_CYCLE_MSG_TIME, DEFAULT_LEADER_CYCLE_MSG_TIME), Keys.LEADER_CYCLE_MSG_TIME);
+	}
+
+	private static Long validateTimer(Long duration, String name) {
+		Objects.requireNonNull(duration, name);
+		if (duration <= 0) {
+			throw new IllegalArgumentException(name + " must be positive");
+		}
+		return duration;
 	}
 
 	public Long getPingLeadingTimer() {
@@ -45,8 +58,8 @@ public class LeaderConsensusOptions {
 	}
 
 	public static final class Builder {
-		private Long pendingToLeaderMsgTime;
-		private Long leaderCycleMsgTime;
+		private Long pendingToLeaderMsgTime = DEFAULT_PENDING_TO_LEADER_MSG_TIME;
+		private Long leaderCycleMsgTime = DEFAULT_LEADER_CYCLE_MSG_TIME;
 
 		private Builder() {
 		}
