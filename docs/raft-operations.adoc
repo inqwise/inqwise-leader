@@ -13,7 +13,7 @@ Targets must be odd, from 1 through 63. A stable three-voter configuration needs
 seven needs four; nine needs five. During a joint transition, both old and new voter sets need their own majority.
 The effective replicated configuration determines quorum, including when a graceful departure temporarily leaves fewer voters.
 
-Give each node a distinct persistent directory and identity. For provisioned certificates, configure an explicit readable
+Give each node a stable identity; the coordinator automatically separates its persistent directory by group and node ID. For provisioned certificates, configure an explicit readable
 `nodeId`, such as `node-a`, matching its certificate URI SAN `urn:inqwise:leader:node:node-a`.
 The directory retains identity, immutable genesis, term/vote, log, commit index and snapshot.
 Keep it across application restarts and machine replacement when the original durable storage is available.
@@ -22,7 +22,7 @@ access to that directory and cannot detect a copied identity on another host.
 
 Bind with `listen()` (127.0.0.1:8080), `listen(port)`, or `listen(port, host)`.
 Omitted static discovery ports default to 8080 independently of the listening port.
-Use distinct ports and explicit directories for multiple processes on one machine.
+Use distinct ports and node IDs for multiple processes on one machine. Their default directories are separate.
 Binding `0.0.0.0` requires a concrete `advertisedEndpoint` reachable by peers.
 Use static `ipv4[:port][#expectedNodeId]` endpoints or SRV discovery; SRV supplies its own port and resolves IPv4 addresses.
 Discovery supplies contact addresses. The identity handshake reports persisted node identity;
@@ -65,7 +65,7 @@ Retain the coordinator and eventually call `leave()` or `close()` after starting
 Read `identity()` after successful startup; storage recovery determines the persisted identity.
 The coordinator owns its HTTP, store and SRV DNS resources; the application owns its Vert.x instance.
 Do not block an event loop while waiting for startup, replication, checkpointing or shutdown.
-Unregistered coordinator exception handlers default to `Throwable::printStackTrace` on the owner context;
+Unregistered coordinator exception handlers default to ERROR logging with the cause on the owner context;
 `exceptionHandler(null)` restores that default. A custom handler replaces it. Handle failed operation futures separately.
 
 Stop initiating leader work when leadership becomes false. Use a custom exception handler for application-specific error policy;
@@ -84,6 +84,12 @@ Deduplicate application operations and handle uncertain proposal outcomes: a fai
 Automatic compaction cannot discard new DATA without the application checkpoint hooks; the retained log has finite bounds.
 
 == Restart and maintenance
+
+Default named-node storage is `.inqwise-leader/<sha256(groupName)>/nodes/<node-hash>`, relative to the working directory.
+No directory configuration is needed normally. Keep that location persistent, or use `dataDirectory` for a custom volume.
+An existing legacy group-only store is selected for its matching identity. Without a configured node ID, a single existing
+named-node directory can also be recovered; multiple candidates require selecting a node ID. Ambiguous or corrupt legacy
+state fails startup. Selection never moves files, and removing a previous custom override does not migrate that store.
 
 For an ordinary restart, stop the process and reopen the same directory with the same group, identity and authority settings.
 The node recovers its durable state before discovery and catches up from the current leader as required.

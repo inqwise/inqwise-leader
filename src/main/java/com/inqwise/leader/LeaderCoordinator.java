@@ -21,6 +21,8 @@ import io.vertx.core.http.HttpServerOptions;
  */
 public final class LeaderCoordinator {
 	private static final Logger LOG = LogManager.getLogger(LeaderCoordinator.class);
+	private static final Handler<Throwable> DEFAULT_EXCEPTION_HANDLER =
+		cause -> LOG.error("Unhandled coordinator exception", cause);
 	private enum Status { NEW, STARTING, RUNNING, FAILED, LEAVING, CLOSING, CLOSED }
 	// One shared owner for lifecycle state; private operations already run on it.
 	private final Context context;
@@ -39,7 +41,7 @@ public final class LeaderCoordinator {
 	private Status status = Status.NEW;
 	private Leadership leadership = new Leadership(false, 0, null);
 	private Handler<Leadership> leadershipHandler;
-	private Handler<Throwable> exceptionHandler = Throwable::printStackTrace;
+	private Handler<Throwable> exceptionHandler = DEFAULT_EXCEPTION_HANDLER;
 	private Future<Void> startFuture;
 	private String listenHost;
 	private int listenPort;
@@ -95,11 +97,13 @@ public final class LeaderCoordinator {
 
 	private Future<Void> initialize() {
 		if (status != Status.STARTING) return Future.failedFuture("Startup canceled");
-		store = VertxRaftStore.create(context.owner(), options.resolvedDataDirectory(),
-			options.getGroupName(), options.getNodeId());
-		serverOptions.setHost(listenHost).setPort(listenPort);
-		var bootstrap = new RaftBootstrap(store, options.getBootstrapAuthorityId(), options.getTargetVoterCount());
-		return HttpRaftTransport.forBootstrap(bootstrap, serverOptions, clientOptions).compose(transport -> {
+		return DataDirectories.resolve(context, options).compose(directory -> {
+			if (status != Status.STARTING) return Future.failedFuture("Startup canceled");
+			store = VertxRaftStore.create(context.owner(), directory, options.getGroupName(), options.getNodeId());
+			serverOptions.setHost(listenHost).setPort(listenPort);
+			var bootstrap = new RaftBootstrap(store, options.getBootstrapAuthorityId(), options.getTargetVoterCount());
+			return HttpRaftTransport.forBootstrap(bootstrap, serverOptions, clientOptions);
+		}).compose(transport -> {
 			http = transport;
 			return store.identity();
 		}).compose(recovered -> {
@@ -156,12 +160,12 @@ public final class LeaderCoordinator {
 	}
 	/**
 	 * Registers asynchronous operation/subscriber error observation.
-	 * Defaults to Throwable::printStackTrace when no handler is registered.
-	 * @param handler callback, or null to restore the default stack-trace handler
+	 * Defaults to ERROR logging with the cause when no handler is registered.
+	 * @param handler callback, or null to restore the default logging handler
 	 * @return this coordinator
 	 */
 	public LeaderCoordinator exceptionHandler(Handler<Throwable> handler) {
-		context.runOnContext(v -> exceptionHandler = handler == null ? Throwable::printStackTrace : handler); return this;
+		context.runOnContext(v -> exceptionHandler = handler == null ? DEFAULT_EXCEPTION_HANDLER : handler); return this;
 	}
 	/**
 	 * Registers application checkpoint production, restoration and retained-entry delivery before startup.

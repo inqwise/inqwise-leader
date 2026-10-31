@@ -69,7 +69,7 @@ use it in a trusted development environment. Configuration and authenticated TLS
 === 1. One node for local development
 
 The zero-configuration factory selects one voter and makes the local node its bootstrap authority.
-It retains identity and consensus state in the group-derived `.inqwise-leader/<group-hash>` directory.
+It retains identity and consensus state in the group-derived `.inqwise-leader/<group-hash>/nodes/<node-a-hash>` directory.
 This node forms its own group and can lead without any peers.
 There is no failover: stopping it stops the group's work.
 
@@ -141,7 +141,7 @@ deployment.compose(vertx::undeploy).compose(ignored -> vertx.close())
 
 === 2. Three voters, initially on one development machine
 
-Use a separate group and separate data directories from the one-node example.
+Use a separate group from the one-node example. The coordinator derives a separate directory for each node automatically.
 The target defaults to `3`; an established one-node group's target does not become three by changing local options.
 Each node needs its own identity, directory and listening port. This development example uses plaintext;
 certificates are added in scenario 5.
@@ -149,9 +149,9 @@ certificates are added in scenario 5.
 [cols="1,1,2",options="header"]
 |===
 |Node ID |Listener |Data directory
-|node-a |127.0.0.1:8081 |.local/raft-dev/cluster/node-a
-|node-b |127.0.0.1:8082 |.local/raft-dev/cluster/node-b
-|node-c |127.0.0.1:8083 |.local/raft-dev/cluster/node-c
+|node-a |127.0.0.1:8081 |.inqwise-leader/<group-hash>/nodes/<node-a-hash>
+|node-b |127.0.0.1:8082 |.inqwise-leader/<group-hash>/nodes/<node-b-hash>
+|node-c |127.0.0.1:8083 |.inqwise-leader/<group-hash>/nodes/<node-c-hash>
 |===
 
 For the remaining scenarios, configure the worker explicitly. Add these members to `RaftWorker`:
@@ -184,7 +184,6 @@ static LeaderOptions clusterNode(String nodeId) {
         .groupName("cluster-job")
         .nodeId(nodeId)
         .bootstrapAuthorityId("node-a")
-        .dataDirectory("./.local/raft-dev/cluster/" + nodeId)
         .discovery(DiscoveryOptions.staticEndpoints(
             "127.0.0.1:8081#node-a",
             "127.0.0.1:8082#node-b",
@@ -204,8 +203,7 @@ Future.all(
 ).onFailure(Throwable::printStackTrace);
 ----
 
-Alternatively, deploy just the matching worker in each of three processes. Each process must have its own writable directory
-and the configuration for its identity. Three processes on one machine demonstrate the protocol, but do not tolerate loss of that machine.
+Alternatively, deploy just the matching worker in each of three processes. Each process needs a stable node identity and write access to its automatically selected directory. Three processes on one machine demonstrate the protocol, but do not tolerate loss of that machine.
 
 On a fresh group, `node-a` must discover enough eligible nodes to form the complete initial three-voter set.
 Starting only one or two nodes does not finish initial formation. Once formed, a quorum is two of three;
@@ -360,7 +358,7 @@ standard Vert.x `DnsClientOptions`. JSON input remains supported through `Leader
 |`state.leader()` becomes false |Stop starting new leader work. Quorum loss is detected through the freshness timeout, not instantaneously.
 |`close()` |Stops this instance without requesting membership removal and retains durable state. Other members may replace it while offline.
 |`leave()` |Drains and requests committed membership removal, then closes. Requires a functioning membership protocol and may fail or time out.
-|`exceptionHandler(handler)` |Receives background and subscriber errors on the owner context. Without registration, errors use `Throwable::printStackTrace`; passing null restores that default.
+|`exceptionHandler(handler)` |Receives background and subscriber errors on the owner context. Without registration, errors use `LOG.error` with the cause; passing null restores that default.
 |Restart with the same directory |Recovers the persisted identity, cluster binding and membership history; it does not create a new group.
 |Change `targetVoterCount` locally |Supplies the target for fresh formation. Existing genesis keeps its persisted target; this is not a live resize command.
 |===
@@ -370,7 +368,15 @@ The default membership wait for leaving is 30 seconds; failure or timeout requir
 The coordinator closes its own HTTP, store and SRV DNS resources; the application owns Vert.x.
 Handle failed operation futures as well, for example with `listen().onFailure(...)`; they remain separate from background error observation.
 
-Give every node a durable directory of its own. Do not share or clone an active node's directory between processes.
+Storage paths are automatic: configured node IDs use `.inqwise-leader/<group-hash>/nodes/<node-hash>`, independent of listening ports.
+Both hashes use SHA-256 of the configured group and node IDs; this avoids case and filename collisions across filesystems.
+Keep the working directory and its storage across restarts. Use `dataDirectory` only for a custom persistent volume,
+an existing custom layout, or explicit recovery. Do not share or clone an active node's directory between processes.
+
+Existing state in the older group-only directory is recovered when its identity matches; no files are moved.
+Without a configured node ID, the coordinator recovers the group-only identity or a single existing node directory.
+Several node directories require a node ID to select one. Corrupt or ambiguous legacy state fails startup instead of creating a new identity.
+Previously configured custom paths still require their override; removing one does not move its existing state.
 An explicit `nodeId` must match the retained identity; changing it does not rename an existing node.
 Omitting it can recover a stored identity or generate a fresh one. With TLS, matching credentials still need provisioning.
 The configured examples specify it explicitly to make bootstrap authority and certificate bindings predictable.

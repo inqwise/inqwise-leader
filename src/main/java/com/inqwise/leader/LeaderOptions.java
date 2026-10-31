@@ -124,16 +124,30 @@ public final class LeaderOptions {
 	}
 
 	/**
-	 * Resolves a stable path using the full UTF-8 group digest, avoiding path traversal and unsafe group characters.
-	 * @return normalized absolute persistent directory
+	 * Derives a stable preferred path from the group digest and configured node ID.
+	 * The coordinator also checks for existing legacy state before opening this path.
+	 * @return normalized absolute preferred directory; existing state is selected during coordinator startup
 	 */
 	public Path resolvedDataDirectory() {
 		String explicit = getDataDirectory();
 		if (explicit != null) return Path.of(explicit).toAbsolutePath().normalize();
+		Path group = defaultGroupDirectory();
+		return getNodeId() == null ? group : nodeDirectory(group, getNodeId());
+	}
+
+	Path defaultGroupDirectory() {
+		return Path.of(".inqwise-leader", digest(Objects.requireNonNull(getGroupName(), "groupName")))
+			.toAbsolutePath().normalize();
+	}
+
+	static Path nodeDirectory(Path group, String nodeId) {
+		return group.resolve("nodes").resolve(digest(nodeId));
+	}
+
+	private static String digest(String value) {
 		try {
-			String group = Objects.requireNonNull(getGroupName(), "groupName");
-			String digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(group.getBytes(StandardCharsets.UTF_8)));
-			return Path.of(".inqwise-leader", digest).toAbsolutePath().normalize();
+			return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+				.digest(value.getBytes(StandardCharsets.UTF_8)));
 		} catch (NoSuchAlgorithmException e) { throw new IllegalStateException("SHA-256 required", e); }
 	}
 
@@ -181,7 +195,7 @@ public final class LeaderOptions {
 		 */
 		public Builder nodeId(String value) { return optional("nodeId", value); }
 		/**
-		 * Sets the persistent directory. Multiple local processes need distinct directories.
+		 * Overrides automatic persistent-directory selection for a custom volume or storage layout.
 		 * @param value directory path; null selects the default
 		 * @return this builder
 		 */

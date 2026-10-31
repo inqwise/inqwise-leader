@@ -73,32 +73,43 @@ class LeaderCoordinatorTest {
 			}), value -> value != null);
 	}
 
-	@Test void unregisteredAndResetExceptionHandlersPrintStackTracesOnOwnerContext() throws Exception {
+	@Test void unregisteredAndResetExceptionHandlersLogCauseOnOwnerContext() throws Exception {
 		var vertx = runtime();
 		var coordinator = LeaderCoordinator.create(vertx, options("node-a", availablePort(vertx)));
 		coordinators.add(coordinator);
-		var prints = new AtomicInteger();
-		var printed = new AtomicReference<>(Promise.<io.vertx.core.Context>promise());
-		var failure = new RuntimeException("subscriber failed") {
-			@Override public void printStackTrace() {
-				prints.incrementAndGet(); printed.get().tryComplete(Vertx.currentContext());
+		var failure = new RuntimeException("subscriber failed");
+		var count = new AtomicInteger();
+		var logged = new AtomicReference<>(Promise.<io.vertx.core.Context>promise());
+		var event = new AtomicReference<org.apache.logging.log4j.core.LogEvent>();
+		var logger = (org.apache.logging.log4j.core.Logger)
+			org.apache.logging.log4j.LogManager.getLogger(LeaderCoordinator.class);
+		var appender = new org.apache.logging.log4j.core.appender.AbstractAppender("coordinator-default-test", null,
+			org.apache.logging.log4j.core.layout.PatternLayout.createDefaultLayout(), false,
+			org.apache.logging.log4j.core.config.Property.EMPTY_ARRAY) {
+			@Override public void append(org.apache.logging.log4j.core.LogEvent value) {
+				if (value.getThrown() != failure) return;
+				event.set(value.toImmutable()); count.incrementAndGet();
+				logged.get().tryComplete(Vertx.currentContext());
 			}
 		};
-		coordinator.leadershipHandler(value -> { throw failure; });
-		assertSame(coordinator.context(), await(printed.get().future()));
-		assertEquals(1, prints.get());
+		appender.start(); logger.addAppender(appender);
+		try {
+			coordinator.leadershipHandler(value -> { throw failure; });
+			assertSame(coordinator.context(), await(logged.get().future()));
+			assertEquals(org.apache.logging.log4j.Level.ERROR, event.get().getLevel());
+			assertEquals("Unhandled coordinator exception", event.get().getMessage().getFormattedMessage());
+			assertSame(failure, event.get().getThrown()); assertEquals(1, count.get());
 
-		var observed = Promise.<Throwable>promise();
-		coordinator.exceptionHandler(cause -> observed.tryComplete(cause));
-		coordinator.leadershipHandler(value -> { throw failure; });
-		assertSame(failure, await(observed.future())); assertEquals(1, prints.get());
+			var observed = Promise.<Throwable>promise();
+			coordinator.exceptionHandler(cause -> observed.tryComplete(cause));
+			coordinator.leadershipHandler(value -> { throw failure; });
+			assertSame(failure, await(observed.future())); assertEquals(1, count.get());
 
-		printed.set(Promise.promise());
-		coordinator.exceptionHandler(null);
-		coordinator.leadershipHandler(value -> { throw failure; });
-		assertSame(coordinator.context(), await(printed.get().future()));
-		assertEquals(2, prints.get());
-		coordinator.leadershipHandler(null);
+			logged.set(Promise.promise()); coordinator.exceptionHandler(null);
+			coordinator.leadershipHandler(value -> { throw failure; });
+			assertSame(coordinator.context(), await(logged.get().future())); assertEquals(2, count.get());
+			coordinator.leadershipHandler(null);
+		} finally { logger.removeAppender(appender); appender.stop(); }
 	}
 
 	@Test void repeatedListenSharesStartupButDifferentBindingFailsWithoutStoppingOwner() throws Exception {

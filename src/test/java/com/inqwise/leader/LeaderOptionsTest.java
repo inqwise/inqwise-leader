@@ -85,6 +85,17 @@ class LeaderOptionsTest {
 		assertEquals(1, contacts(copy).size());
 		assertEquals(1, contacts(options).size());
 	}
+	@Test void namedNodesAutomaticallyHaveDistinctStableDirectoriesWithoutAnOverride() {
+		var group = LeaderOptions.builder(minimal()).build();
+		var a = group.toBuilder().nodeId("node-a").build(); var b = group.toBuilder().nodeId("node-b").build();
+		assertNull(a.getDataDirectory()); assertNull(b.getDataDirectory());
+		assertEquals(group.resolvedDataDirectory().resolve("nodes"), a.resolvedDataDirectory().getParent());
+		assertTrue(a.resolvedDataDirectory().getFileName().toString().matches("[a-f0-9]{64}"));
+		assertNotEquals(a.resolvedDataDirectory(), group.toBuilder().nodeId("NODE-A").build().resolvedDataDirectory());
+		assertNotEquals(a.resolvedDataDirectory(), b.resolvedDataDirectory());
+		assertEquals(a.resolvedDataDirectory(), a.toBuilder().build().resolvedDataDirectory());
+	}
+
 	@Test void defaultDirectoryIsStableAndCannotTraverseThroughGroupName() {
 		var first = LeaderOptions.builder(minimal().put("groupName", "../../scheduled / 雨")).build();
 		var second = first.toBuilder().build();

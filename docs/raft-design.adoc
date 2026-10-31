@@ -684,8 +684,11 @@ election timing 2500..5000 ms with 1000-ms heartbeats, one-second membership ref
 two standby learners and a 30-second graceful membership deadline. Empty discovery with the default target leaves formation
 pending; explicitly choose target one for single-node development. Bind a reachable IPv4 listener for deployment;
 `0.0.0.0` requires a concrete advertised callback endpoint. Optional initial/expected `nodeId` never renames existing storage.
-The default persistent directory uses the full SHA-256 digest of the UTF-8 group name, avoiding unsafe path characters;
-multiple processes on one machine require distinct explicit data directories and listener ports.
+Default named-node storage uses `.inqwise-leader/<sha256(groupName)>/nodes/<node-hash>`, avoiding unsafe group characters
+and separating local nodes automatically. The directory override is reserved for custom storage/recovery. Listener ports
+do not affect identity paths. Native Vert.x filesystem operations select a matching legacy group-only store before opening
+a new named path; corrupt or ambiguous legacy state fails rather than silently creating a new identity. With no configured
+node ID, selection recovers an existing group slot or a single named directory; several candidates require a node ID.
 
 `LeaderCoordinator.create(vertx, options, serverOptions, clientOptions)` accepts validated immutable options and copies HTTP settings,
 returning an unopened coordinator without filesystem or network I/O. Register handlers, then compose `listen()`.
@@ -720,7 +723,7 @@ resources acquired in the meantime; it does not permit late initialization to be
 
 `leadershipHandler`, `exceptionHandler`, startup/leave/close futures, and forwarded application snapshot hooks retain owner
 context behavior. `snapshotHandlers` must be registered before start and is forwarded before the participant recovers.
-The coordinator defaults background/subscriber errors to `Throwable::printStackTrace`; a custom exception handler replaces it,
+The coordinator defaults background/subscriber errors to ERROR logging with the cause; a custom exception handler replaces it,
 and null restores the default. Failed operation futures retain their separate failure results.
 `leave()` uses the configured deadline; `leave(timeoutMillis)` overrides one operation. `close()` cancels local work without
 promising removal, including during startup. Failed startup automatically releases owned resources.
@@ -835,7 +838,6 @@ The following example describes a regular node using static discovery:
   "groupName": "scheduled-job",
   "nodeId": "node-a",
   "bootstrapAuthorityId": "node-a",
-  "dataDirectory": "./data/leader-node-a",
   "advertisedEndpoint": "192.0.2.10",
   "targetVoterCount": 3,
   "discovery": {
@@ -853,8 +855,8 @@ All nodes configure the same `bootstrapAuthorityId`. The node whose persisted ID
 there is no separate authority boolean or duplicate bootstrap endpoint. Discovery provides its route.
 The authority can also run application work on the same HTTP listener.
 Select a persistent data directory per process; never derive identity from an ephemeral Vert.x cluster node ID.
-An omitted directory defaults to `./.inqwise-leader/<sha256(groupName)>` for a single local process;
-multiple local processes require distinct directories.
+An omitted directory is selected automatically by group and node ID. Named nodes use
+`./.inqwise-leader/<sha256(groupName)>/nodes/<node-hash>`; generated identities retain a recoverable group slot.
 
 For this stage, static endpoint syntax is `ipv4[:port][#expectedNodeId]`.
 IPv6 and hostname literals in static endpoints are outside the initial parser scope.
