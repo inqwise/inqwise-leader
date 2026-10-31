@@ -10,6 +10,8 @@ import java.util.concurrent.TimeoutException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.concurrent.CancellationException;
+
 import io.vertx.core.Completable;
 import io.vertx.core.Context;
 import io.vertx.core.Future;
@@ -36,7 +38,6 @@ final class HttpRaftClient {
 	private final int limit;
 	private final long timeoutMillis;
 	private final Set<Exchange<?>> pending = new HashSet<>();
-	private Future<Void> closing;
 	private Promise<Void> closeResult;
 	private boolean httpClosed;
 	private Throwable closeFailure;
@@ -54,8 +55,9 @@ final class HttpRaftClient {
 	<T> void request(NodeEndpoint endpoint, HttpMethod method, String suffix, Encoder encoder, Decoder<T> decoder,
 		boolean large, Completable<T> completion) {
 		Objects.requireNonNull(completion, "completion");
-		if (closing != null || pending.size() >= limit) {
-			completion.fail(closing != null ? "Transport closed" : "Transport request limit reached"); return;
+		if (closeResult != null || pending.size() >= limit) {
+			completion.fail(closeResult != null ? new CancellationException("Transport closed")
+				: new RaftUnavailableException("Transport request limit reached")); return;
 		}
 		var exchange = new Exchange<T>(endpoint, method, suffix, decoder, completion);
 		pending.add(exchange);
@@ -74,16 +76,17 @@ final class HttpRaftClient {
 	}
 
 	Future<Void> close() {
-		if (closing == null) {
+		if (closeResult == null) {
 			// Mark closed before callbacks can submit new work.
 			closeResult = ContextDispatch.promise(context);
-			closing = closeResult.future();
-			for (var exchange : List.copyOf(pending)) exchange.finish(null, new IOException("Transport closed"));
+			for (var exchange : List.copyOf(pending)) {
+				exchange.finish(null, new CancellationException("Transport closed"));
+			}
 			client.close().onComplete(result -> {
 				httpClosed = true; closeFailure = result.cause(); completeClose();
 			});
 		}
-		return closing;
+		return closeResult.future();
 	}
 
 	private void completeClose() {
@@ -137,7 +140,13 @@ final class HttpRaftClient {
 					throw new IOException("Peer identity mismatch");
 				}
 				boolean resultBody = method == HttpMethod.GET || suffix.equals("/join") || suffix.equals("/leave");
-				if (response.statusCode() != (resultBody ? 200 : 202)) throw new IOException("Peer HTTP status " + response.statusCode());
+				int status = response.statusCode();
+				if (status != (resultBody ? 200 : 202)) {
+					if (status == 425 || status == 429 || status == 503) {
+						throw new RaftUnavailableException("Peer HTTP status " + status);
+					}
+					throw new IOException("Peer HTTP status " + status);
+				}
 				if (resultBody && !RaftWireCodec.CONTENT_TYPE.equals(response.getHeader("Content-Type"))) {
 					throw new IOException("Unsupported response content type");
 				}

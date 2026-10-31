@@ -16,6 +16,22 @@ class ContextDispatchTest {
 	final Context context = vertx.getOrCreateContext();
 	@AfterEach void shutdown() throws Exception { await(vertx.close()); }
 
+	@Test void thrownGuardFailureCompletesTheFutureAndPreservesCauseAndOwnerContext() throws Exception {
+		var cause = new java.io.IOException("original cause");
+		var failure = new IllegalStateException("invalid lifecycle", cause);
+		Future<Void> result = assertDoesNotThrow(() -> ContextDispatch.call(context, () -> { throw failure; }));
+		assertThrows(Exception.class, () -> await(result));
+		assertSame(failure, result.cause()); assertSame(cause, result.cause().getCause());
+		assertTrue(result.cause().getStackTrace().length > 0);
+		var owner = Promise.<Context>promise();
+		result.onFailure(error -> owner.tryComplete(Vertx.currentContext()));
+		assertSame(context, await(owner.future()));
+		var assertion = new AssertionError("unexpected assertion");
+		Future<Void> unexpected = ContextDispatch.call(context, () -> { throw assertion; });
+		assertThrows(Exception.class, () -> await(unexpected));
+		assertSame(assertion, unexpected.cause());
+	}
+
 	@Test void relayedForeignCompletionAndLateHandlersUseTheOwnerContext() throws Exception {
 		var source = Promise.<String>promise();
 		var relayed = ContextDispatch.relay(context, source.future());

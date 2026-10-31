@@ -1,6 +1,7 @@
 package com.inqwise.leader;
 
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
 
 import java.util.function.Function;
 import java.util.random.RandomGenerator;
@@ -30,7 +31,6 @@ public final class LeaderCoordinator {
 	private final HttpServerOptions serverOptions;
 	private final HttpClientOptions clientOptions;
 	private AsyncRaftStore store;
-	private Future<Void> initializationFuture;
 	private Function<RaftElection.SnapshotPoint, Future<String>> snapshotProvider;
 	private Function<RaftSnapshot, Future<Void>> snapshotRestorer;
 	private Handler<RaftLogEntry> committedHandler;
@@ -96,9 +96,9 @@ public final class LeaderCoordinator {
 	}
 
 	private Future<Void> initialize() {
-		if (status != Status.STARTING) return Future.failedFuture("Startup canceled");
+		if (status != Status.STARTING) throw new CancellationException("Startup canceled");
 		return DataDirectories.resolve(context, options).compose(directory -> {
-			if (status != Status.STARTING) return Future.failedFuture("Startup canceled");
+			if (status != Status.STARTING) throw new CancellationException("Startup canceled");
 			store = VertxRaftStore.create(context.owner(), directory, options.getGroupName(), options.getNodeId());
 			serverOptions.setHost(listenHost).setPort(listenPort);
 			var bootstrap = new RaftBootstrap(store, options.getBootstrapAuthorityId(), options.getTargetVoterCount());
@@ -115,7 +115,7 @@ public final class LeaderCoordinator {
 			}, true);
 		}).compose(recovered -> {
 			identity = recovered;
-			if (status != Status.STARTING) return Future.failedFuture("Startup canceled");
+			if (status != Status.STARTING) throw new CancellationException("Startup canceled");
 			NodeDiscovery discovery = switch (options.getDiscovery()) {
 				case DiscoveryOptions.Static contacts -> NodeDiscovery.staticEndpoints(contacts.endpoints());
 				case DiscoveryOptions.Srv service -> {
@@ -177,7 +177,7 @@ public final class LeaderCoordinator {
 	public Future<Void> snapshotHandlers(Function<RaftElection.SnapshotPoint, Future<String>> provider,
 		Function<RaftSnapshot, Future<Void>> restorer, Handler<RaftLogEntry> committed) {
 		return ContextDispatch.call(context, () -> {
-			if (status != Status.NEW) return Future.failedFuture("Register application hooks before startup");
+			if (status != Status.NEW) throw new IllegalStateException("Register application hooks before startup");
 			Objects.requireNonNull(provider, "provider"); Objects.requireNonNull(restorer, "restorer");
 			Objects.requireNonNull(committed, "committed");
 			snapshotProvider = provider; snapshotRestorer = restorer; committedHandler = committed;
@@ -211,19 +211,24 @@ public final class LeaderCoordinator {
 	private Future<Void> listenOnContext(int port, String host) {
 		new NodeEndpoint(host.equals("0.0.0.0") ? "127.0.0.1" : host, port, null);
 		if (host.equals("0.0.0.0") && options.getAdvertisedEndpoint() == null) {
-			return Future.failedFuture("Wildcard listener requires advertisedEndpoint");
+			throw new IllegalArgumentException("Wildcard listener requires advertisedEndpoint");
 		}
 		if (status == Status.STARTING || status == Status.RUNNING) {
-			return port == listenPort && host.equals(listenHost) ? startFuture
-				: Future.failedFuture("Coordinator is already listening or starting at another address");
+			if (port != listenPort || !host.equals(listenHost)) {
+				throw new IllegalStateException("Coordinator is already listening or starting at another address");
+			}
+			return startFuture;
 		}
-		if (status != Status.NEW) return Future.failedFuture("Create a new coordinator after shutdown/failure");
+		if (status != Status.NEW) throw new IllegalStateException("Create a new coordinator after shutdown/failure");
 		listenHost = host; listenPort = port;
 		status = Status.STARTING;
-		try { initializationFuture = initialize(); }
-		catch (Exception e) { initializationFuture = Future.failedFuture(e); }
-		startFuture = initializationFuture.compose(ignored -> status == Status.STARTING
-			? controller.start() : Future.failedFuture("Startup canceled")).transform(result -> {
+		Future<Void> initialization;
+		try { initialization = initialize(); }
+		catch (Exception e) { initialization = Future.failedFuture(e); }
+		startFuture = initialization.compose(ignored -> {
+			if (status != Status.STARTING) throw new CancellationException("Startup canceled");
+			return controller.start();
+		}).transform(result -> {
 			if (result.succeeded()) {
 				if (status == Status.STARTING) status = Status.RUNNING;
 				return Future.succeededFuture();
@@ -250,7 +255,7 @@ public final class LeaderCoordinator {
 	 */
 	public Future<LeadershipToken> fencingToken() {
 		return ContextDispatch.call(context, () -> {
-			if (status != Status.RUNNING || controller == null) return Future.failedFuture("A running coordinator is required");
+			if (status != Status.RUNNING || controller == null) throw new IllegalStateException("A running coordinator is required");
 			return controller.participant().compose(VertxLeaderNode::fencingToken).map(token -> {
 				if (status != Status.RUNNING) throw new IllegalStateException("Coordinator stopped before token delivery");
 				return token;
@@ -264,7 +269,7 @@ public final class LeaderCoordinator {
 	 */
 	public Future<VertxLeaderNode> participant() {
 		return ContextDispatch.call(context, () -> controller == null
-			? Future.failedFuture("Participant is unavailable before startup") : controller.participant());
+			? Future.failedFuture(new RaftUnavailableException("Participant is unavailable before startup")) : controller.participant());
 	}
 	/**
 	 * Reads the concrete configured listener endpoint after startup.
@@ -272,7 +277,7 @@ public final class LeaderCoordinator {
 	 */
 	public Future<NodeEndpoint> localEndpoint() {
 		return ContextDispatch.call(context, () -> {
-			if (status != Status.RUNNING && status != Status.LEAVING) return Future.failedFuture("Listener is not running");
+			if (status != Status.RUNNING && status != Status.LEAVING) throw new IllegalStateException("Listener is not running");
 			return options.getMembershipOptions(listenPort).advertisedEndpoint() == null ? http.localEndpoint()
 				: Future.succeededFuture(options.getMembershipOptions(listenPort).advertisedEndpoint());
 		});
@@ -292,9 +297,9 @@ public final class LeaderCoordinator {
 	}
 
 	private Future<Void> leaveOnContext(long timeoutMillis) {
-		if (timeoutMillis <= 0) return Future.failedFuture("A positive leave deadline is required");
+		if (timeoutMillis <= 0) throw new IllegalArgumentException("A positive leave deadline is required");
 		if (leaveFuture != null) return leaveFuture;
-		if (status != Status.RUNNING) return Future.failedFuture("A running coordinator is required");
+		if (status != Status.RUNNING) throw new IllegalStateException("A running coordinator is required");
 		status = Status.LEAVING; observeLeadership(new Leadership(false, leadership.term(), null));
 		leaveFuture = controller.leave(timeoutMillis).transform(removed -> cleanup().transform(cleaned -> {
 			status = Status.CLOSED;
@@ -317,8 +322,8 @@ public final class LeaderCoordinator {
 	private Future<Void> closeOnContext() {
 		if (closeFuture == null) {
 			status = Status.CLOSING; observeLeadership(new Leadership(false, leadership.term(), null));
-			closeFuture = (initializationFuture == null ? cleanup()
-				: initializationFuture.transform(ignored -> cleanup())).andThen(result -> status = Status.CLOSED);
+			closeFuture = (startFuture == null ? cleanup()
+				: startFuture.transform(ignored -> cleanup())).andThen(result -> status = Status.CLOSED);
 		}
 		return closeFuture;
 	}

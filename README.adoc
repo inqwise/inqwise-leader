@@ -367,6 +367,10 @@ Do not use `leave()` as the single-node worker's normal stop: the last voter can
 The default membership wait for leaving is 30 seconds; failure or timeout requires checking the committed outcome before retrying.
 The coordinator closes its own HTTP, store and SRV DNS resources; the application owns Vert.x.
 Handle failed operation futures as well, for example with `listen().onFailure(...)`; they remain separate from background error observation.
+Invalid local arguments and lifecycle usage report concrete exceptions such as `IllegalArgumentException` and
+`IllegalStateException` through the guarded operation's Future. `RaftUnavailableException` is a stackless expected failure
+for pending readiness, busy operations and resource pressure. It does not establish that a failed mutation was unapplied;
+check the committed outcome or use idempotency before retrying. Original I/O and application failure causes are preserved.
 
 Storage paths are automatic: configured node IDs use `.inqwise-leader/<group-hash>/nodes/<node-hash>`, independent of listening ports.
 Both hashes use SHA-256 of the configured group and node IDs; this avoids case and filename collisions across filesystems.

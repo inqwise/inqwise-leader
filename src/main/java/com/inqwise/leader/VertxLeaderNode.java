@@ -51,7 +51,6 @@ public final class VertxLeaderNode {
 	private Handler<RaftLogEntry> committedHandler;
 	private Leadership leadership = new Leadership(false, 0, null);
 	private Promise<Void> starting;
-	private Future<Void> startFuture;
 	private Future<Void> closeFuture;
 	private long healthTimer = -1;
 	private long observedTerm;
@@ -61,7 +60,7 @@ public final class VertxLeaderNode {
 	private static final int COMPACTION_THRESHOLD = 128;
 	private Function<RaftElection.SnapshotPoint, Future<String>> snapshotProvider;
 	private Function<RaftSnapshot, Future<Void>> snapshotRestorer = checkpoint -> checkpoint.data().isEmpty()
-		? Future.succeededFuture() : Future.failedFuture("An application snapshot restorer is required");
+		? Future.succeededFuture() : Future.failedFuture(new IllegalStateException("An application snapshot restorer is required"));
 	private Future<Void> applicationBarrier = Future.succeededFuture();
 	private Promise<RaftSnapshot> compaction;
 	private RaftSnapshot preparedSnapshot;
@@ -173,7 +172,7 @@ public final class VertxLeaderNode {
 	public Future<Void> snapshotHandlers(Function<RaftElection.SnapshotPoint, Future<String>> provider,
 		Function<RaftSnapshot, Future<Void>> restorer) {
 		return ContextDispatch.call(context, () -> {
-			if (status != Status.NEW) return Future.failedFuture("Register snapshot hooks before startup");
+			if (status != Status.NEW) throw new IllegalStateException("Register snapshot hooks before startup");
 			snapshotProvider = Objects.requireNonNull(provider, "provider");
 			snapshotRestorer = Objects.requireNonNull(restorer, "restorer");
 			return Future.succeededFuture();
@@ -195,11 +194,10 @@ public final class VertxLeaderNode {
 	 */
 	public Future<Void> start() {
 		return ContextDispatch.call(context, () -> {
-			if (startFuture != null && (status == Status.STARTING || status == Status.RUNNING)) return startFuture;
-			if (status != Status.NEW) return Future.failedFuture("Create a new node after close or failure");
+			if (starting != null && (status == Status.STARTING || status == Status.RUNNING)) return starting.future();
+			if (status != Status.NEW) throw new IllegalStateException("Create a new node after close or failure");
 			status = Status.STARTING;
 			starting = ContextDispatch.promise(context);
-			startFuture = starting.future();
 			ContextDispatch.relay(context, store.open()).compose(v -> {
 				if (status != Status.STARTING) return Future.failedFuture(new CancellationException("Startup canceled"));
 				return ContextDispatch.relay(context, store.identity());
@@ -222,7 +220,7 @@ public final class VertxLeaderNode {
 					starting.tryComplete();
 				} catch (Exception e) { fail(e); }
 			}));
-			return startFuture;
+			return starting.future();
 		});
 	}
 
@@ -253,7 +251,7 @@ public final class VertxLeaderNode {
 	public Future<LeadershipToken> fencingToken() {
 		return ContextDispatch.call(context, () -> {
 			requireRunning(); updateLeadership();
-			if (!leadership.leader()) return Future.failedFuture("Ready leadership is required for a fencing token");
+			if (!leadership.leader()) return Future.failedFuture(new RaftUnavailableException("Ready leadership is required for a fencing token"));
 			return Future.succeededFuture(new LeadershipToken(identity.groupName(), clusterId, leadership.term()));
 		});
 	}
@@ -269,7 +267,7 @@ public final class VertxLeaderNode {
 			requireRunning();
 			updateLeadership();
 			if (!leadership.leader() || proposal != null || membershipChange != null || engine.snapshot().persistencePending()) {
-				return Future.failedFuture(new IllegalStateException("A ready leader with no outstanding write is required"));
+				throw new RaftUnavailableException("A ready leader with no outstanding write is required");
 			}
 			List<RaftElection.Effect> effects = engine.propose(data);
 			var log = engine.replication().state().log();
@@ -372,7 +370,7 @@ public final class VertxLeaderNode {
 			if (!(expectedTerm >= 0 ? protocolReady : leadership.leader()) || proposal != null || membershipChange != null
 				|| (expectedTerm >= 0 && (leadership.term() != expectedTerm
 					|| engine.membership().configurationIndex() != expectedConfigurationIndex))) {
-				return Future.failedFuture("A ready leader with no outstanding operation is required");
+				return Future.failedFuture(new RaftUnavailableException("A ready leader with no outstanding operation is required"));
 			}
 			var effects = operation.get();
 			var configuration = engine.membership().effective();
@@ -622,10 +620,10 @@ public final class VertxLeaderNode {
 	}
 
 	private Future<RaftSnapshot> beginCompaction() {
-		if (compaction != null) return Future.failedFuture("A checkpoint is already in progress");
-		if (engine.snapshot().persistencePending()) return Future.failedFuture("Wait for the pending durable write");
+		if (compaction != null) return Future.failedFuture(new RaftUnavailableException("A checkpoint is already in progress"));
+		if (engine.snapshot().persistencePending()) return Future.failedFuture(new RaftUnavailableException("Wait for the pending durable write"));
 		var point = engine.snapshotPoint();
-		if (point.containsData() && snapshotProvider == null) return Future.failedFuture("DATA requires application snapshot hooks");
+		if (point.containsData() && snapshotProvider == null) return Future.failedFuture(new IllegalStateException("DATA requires application snapshot hooks"));
 		compaction = ContextDispatch.promise(context);
 		var pending = compaction;
 		var result = pending.future();
@@ -681,7 +679,7 @@ public final class VertxLeaderNode {
 			}
 			if (!binding.installed() || !clusterId.equals(binding.genesis().clusterId())
 				|| !voters.equals(binding.genesis().voters())) {
-				return Future.failedFuture("Configured cluster/voters do not match installed genesis");
+				throw new IllegalStateException("Configured cluster/voters do not match installed genesis");
 			}
 			learnerAdmission = binding.learnerAdmission();
 			return ContextDispatch.relay(context, transport.validateBinding(identity, binding.genesis(), learnerAdmission));

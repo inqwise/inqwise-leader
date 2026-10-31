@@ -67,6 +67,8 @@ The coordinator owns its HTTP, store and SRV DNS resources; the application owns
 Do not block an event loop while waiting for startup, replication, checkpointing or shutdown.
 Unregistered coordinator exception handlers default to ERROR logging with the cause on the owner context;
 `exceptionHandler(null)` restores that default. A custom handler replaces it. Handle failed operation futures separately.
+Expected not-ready/busy failures use stackless `RaftUnavailableException`; invalid arguments/lifecycle usage use concrete
+diagnostic exceptions. Availability, cancellation or timeout alone does not prove a mutation failed to commit.
 
 Stop initiating leader work when leadership becomes false. Use a custom exception handler for application-specific error policy;
 retryable discovery errors do not themselves revoke readiness or stop application jobs.

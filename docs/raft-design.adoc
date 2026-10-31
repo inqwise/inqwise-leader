@@ -723,6 +723,20 @@ resources acquired in the meantime; it does not permit late initialization to be
 
 `leadershipHandler`, `exceptionHandler`, startup/leave/close futures, and forwarded application snapshot hooks retain owner
 context behavior. `snapshotHandlers` must be registered before start and is forwarded before the participant recovers.
+Completed control-pass Futures are released while idle. Startup/close aliases of existing Promises are not stored separately,
+and the coordinator waits for its existing startup result during cancellation rather than retaining another initialization Future.
+Shared lifecycle results and accepted-I/O/restoration barriers remain: they preserve idempotence, failures and safe shutdown.
+A Promise is not a lighter substitute for a Future in Vert.x; its implementation is also the Future.
+
+Invalid arguments, lifecycle misuse and inconsistent bindings use concrete exceptions with diagnostic stack traces.
+Guards throw inside `ContextDispatch.call` or Future mappers, which fail the existing result with the original Throwable;
+the dispatcher also captures unexpected Errors so they do not strand its Promise. Ordinary asynchronous completion handlers
+fail their Promise/completion explicitly rather than relying on a thrown callback exception.
+Expected pending/busy/resource-pressure failures use the public stackless `RaftUnavailableException`.
+HTTP 425, 429 and 503 responses use that availability type locally; other rejected HTTP statuses retain transport exceptions.
+Peer rejection does not serialize the server's Java exception type. Cancellation and timeout retain their standard types.
+Availability classification does not establish a mutation's commit outcome; retained failure evidence and idempotency remain necessary.
+
 The coordinator defaults background/subscriber errors to ERROR logging with the cause; a custom exception handler replaces it,
 and null restores the default. Failed operation futures retain their separate failure results.
 `leave()` uses the configured deadline; `leave(timeoutMillis)` overrides one operation. `close()` cancels local work without

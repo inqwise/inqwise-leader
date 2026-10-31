@@ -39,7 +39,6 @@ final class HttpRaftServer implements Handler<HttpServerRequest> {
 	private final Map<String, Route<?, ?>> posts = new HashMap<>();
 	private final Set<Incoming<?, ?>> pending = new HashSet<>();
 	private Future<Integer> listening;
-	private Future<Void> closing;
 	private Promise<Void> closeResult;
 	private boolean httpClosed;
 	private Throwable closeFailure;
@@ -63,25 +62,25 @@ final class HttpRaftServer implements Handler<HttpServerRequest> {
 	}
 
 	private void register(Map<String, Route<?, ?>> routes, String suffix, Route<?, ?> route) {
-		if (listening != null || closing != null) throw new IllegalStateException("Register handlers before listen");
+		if (listening != null || closeResult != null) throw new IllegalStateException("Register handlers before listen");
 		if (routes.putIfAbsent(basePath + suffix, route) != null) throw new IllegalArgumentException("Duplicate route");
 	}
 
 	Future<Integer> listen() {
-		if (closing != null) return Future.failedFuture("Listener closed");
+		if (closeResult != null) return Future.failedFuture(new IllegalStateException("Listener closed"));
 		if (listening == null) listening = server.listen().map(HttpServer::actualPort);
 		return listening;
 	}
 	int actualPort() { return server.actualPort(); }
 
 	Future<Void> close() {
-		if (closing == null) {
-			closeResult = ContextDispatch.promise(context); closing = closeResult.future();
+		if (closeResult == null) {
+			closeResult = ContextDispatch.promise(context);
 			for (var request : List.copyOf(pending)) request.finish(503, null);
 			var stopped = listening == null ? server.close() : listening.transform(ignored -> server.close());
 			stopped.onComplete(result -> { httpClosed = true; closeFailure = result.cause(); completeClose(); });
 		}
-		return closing;
+		return closeResult.future();
 	}
 
 	private void completeClose() {
@@ -94,7 +93,7 @@ final class HttpRaftServer implements Handler<HttpServerRequest> {
 		request.pause();
 		if (Vertx.currentContext() != context) { context.runOnContext(ignored -> handle(request)); return; }
 		request.response().putHeader(HttpRaftClient.NODE_HEADER, nodeId);
-		if (closing != null) { reject(request, 503); return; }
+		if (closeResult != null) { reject(request, 503); return; }
 		if (pending.size() >= limit) { reject(request, 429); return; }
 		try {
 			String peer = verifier.verify(request.connection(), request.getHeader(HttpRaftClient.NODE_HEADER));
@@ -210,7 +209,7 @@ final class HttpRaftServer implements Handler<HttpServerRequest> {
 		}
 
 		void release() {
-			if (!active && !working && (!processing || closing != null)) pending.remove(this);
+			if (!active && !working && (!processing || closeResult != null)) pending.remove(this);
 		}
 	}
 }

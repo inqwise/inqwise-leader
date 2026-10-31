@@ -13,6 +13,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.BiConsumer;
 
+import java.util.concurrent.CancellationException;
+
 import io.vertx.core.Context;
 import io.vertx.core.Completable;
 import io.vertx.core.Future;
@@ -148,7 +150,7 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 		return ContextDispatch.call(context, () -> {
 			ensureListening();
 			if (bootstrap == null || !identity.nodeId().equals(bootstrap.authorityId())) {
-				return Future.failedFuture("This transport is not the bootstrap authority");
+				throw new IllegalStateException("This transport is not the bootstrap authority");
 			}
 			return discover(endpoints).compose(discovery -> bootstrap.form(discovery.peers()))
 				.compose(genesis -> refreshBinding().compose(v -> distribute(genesis)));
@@ -163,9 +165,9 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 	public Future<RaftGenesis> fetchBootstrap(NodeEndpoint authority) {
 		return ContextDispatch.call(context, () -> {
 			ensureListening();
-			if (bootstrap == null) return Future.failedFuture("Bootstrap is not enabled");
+			if (bootstrap == null) throw new IllegalStateException("Bootstrap is not enabled");
 			if (authority.expectedNodeId() != null && !authority.expectedNodeId().equals(bootstrap.authorityId())) {
-				return Future.failedFuture("Unexpected authority identity");
+				throw new IllegalArgumentException("Unexpected authority identity");
 			}
 			var expected = new NodeEndpoint(authority.host(), authority.port(), bootstrap.authorityId());
 			return request(expected, RaftConnection::genesis)
@@ -184,7 +186,7 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 				installations.put(voter, bootstrap.install(genesis, identity.nodeId()).compose(v -> refreshBinding()));
 			} else {
 				var endpoint = peers.endpoint(voter);
-				installations.put(voter, endpoint == null ? Future.failedFuture("Selected voter is unavailable")
+				installations.put(voter, endpoint == null ? Future.failedFuture(new RaftUnavailableException("Selected voter is unavailable"))
 					: request(endpoint, (connection, completion) -> connection.install(genesis, completion)));
 			}
 		}
@@ -223,7 +225,7 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 				verifier, MAX_IN_FLIGHT, TIMEOUT_MILLIS);
 			registerRequests();
 			listenFuture = server.listen().compose(port -> closed
-				? Future.failedFuture(new java.util.concurrent.CancellationException("Transport closed during bind"))
+				? Future.failedFuture(new CancellationException("Transport closed during bind"))
 				: Future.succeededFuture(port));
 			return listenFuture;
 		});
@@ -234,7 +236,7 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 	 * @return bound port
 	 */
 	public Future<Integer> listen() {
-		return listen(envelope -> attachedNode == null ? Future.failedFuture("Participant not ready")
+		return listen(envelope -> attachedNode == null ? Future.failedFuture(new RaftUnavailableException("Participant not ready"))
 			: attachedNode.receive(envelope));
 	}
 
@@ -253,7 +255,7 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 		return ContextDispatch.call(context, () -> {
 			ensureActive();
 			if (node.context() != context || (attachedNode != null && attachedNode != node)) {
-				return Future.failedFuture("A different participant/context is already attached");
+				throw new IllegalArgumentException("A different participant/context is already attached");
 			}
 			attachedNode = node; receiver = node::receive;
 			return Future.succeededFuture();
@@ -303,7 +305,7 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 		var keep = Set.copyOf(members);
 		return ContextDispatch.call(context, () -> {
 			ensureActive();
-			if (ageMillis < 1) return Future.failedFuture("Positive route age is required");
+			if (ageMillis < 1) throw new IllegalArgumentException("Positive route age is required");
 			peers.prune(keep, ageMillis);
 			return Future.succeededFuture();
 		});
@@ -348,23 +350,23 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 	public Future<RaftGenesis> joinCluster(NodeEndpoint leader, NodeEndpoint advertised) {
 		return ContextDispatch.call(context, () -> {
 			ensureListening();
-			if (bootstrap == null || departing) return Future.failedFuture("Admission is unavailable while departing or unbound");
+			if (bootstrap == null || departing) return Future.failedFuture(new RaftUnavailableException("Admission is unavailable while departing or unbound"));
 			return request(leader, RaftConnection::membership).compose(status -> {
 				if (!status.ready() || !identity.groupName().equals(status.genesis().groupName())
 					|| !bootstrap.authorityId().equals(status.genesis().authorityId())
 					|| (clusterId == null && status.genesis().voters().contains(identity.nodeId()))) {
-					return Future.failedFuture("Ready leader admission is required; initial voters must recover/bootstrap");
+					return Future.failedFuture(new RaftUnavailableException("Ready leader admission is required; initial voters must recover/bootstrap"));
 				}
 				return refreshBinding().compose(v -> {
-					if (clusterId != null && !clusterId.equals(status.genesis().clusterId())) return Future.failedFuture("Cluster mismatch");
+					if (clusterId != null && !clusterId.equals(status.genesis().clusterId())) throw new SecurityException("Cluster mismatch");
 					var request = new JoinRequest(identity, clusterId, advertised, status.term());
 					var expected = new NodeEndpoint(leader.host(), leader.port(), status.identity().nodeId());
 					return this.<MemberStatus>request(expected, (connection, completion) -> connection.join(request, completion))
 						.compose(admitted -> {
 							ensureActive();
-							if (departing) return Future.failedFuture("Node is departing");
+							if (departing) return Future.failedFuture(new CancellationException("Node is departing"));
 							if (!admitted.ready() || admitted.term() != status.term() || !admitted.genesis().equals(status.genesis())
-								|| !admitted.configuration().learners().contains(identity.nodeId())) return Future.failedFuture("Admission changed during request");
+								|| !admitted.configuration().learners().contains(identity.nodeId())) return Future.failedFuture(new RaftUnavailableException("Admission changed during request"));
 							Future<Void> installation = admitted.genesis().voters().contains(identity.nodeId())
 								? bootstrap.store().installGenesis(admitted.genesis()) : bootstrap.store().installLearnerGenesis(admitted.genesis());
 							return installation.compose(vv -> refreshBinding()).map(admitted.genesis());
@@ -401,11 +403,11 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 		return ContextDispatch.call(context, () -> {
 			ensureListening(); departing = true;
 			return refreshBinding().compose(v -> {
-				if (!installed || clusterId == null) return Future.failedFuture("Installed cluster binding is required");
+				if (!installed || clusterId == null) return Future.failedFuture(new RaftUnavailableException("Installed cluster binding is required"));
 				return request(leader, RaftConnection::membership);
 			}).compose(status -> {
 				if (!status.ready() || !clusterId.equals(status.genesis().clusterId())
-					|| !identity.groupName().equals(status.identity().groupName())) return Future.failedFuture("Ready bound leader required");
+					|| !identity.groupName().equals(status.identity().groupName())) return Future.failedFuture(new RaftUnavailableException("Ready bound leader required"));
 				var expected = new NodeEndpoint(leader.host(), leader.port(), status.identity().nodeId());
 				var request = new LeaveRequest(identity, clusterId, status.term());
 				return this.<LeaveResult>request(expected, (connection, completion) -> connection.leave(request, completion))
@@ -425,9 +427,9 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 	 * @return coherent local membership observation, or failure while unavailable
 	 */
 	@Override public Future<MemberStatus> localMemberStatus() {
-		if (bootstrap == null || attachedNode == null) return Future.failedFuture("Participant not ready");
+		if (bootstrap == null || attachedNode == null) return Future.failedFuture(new RaftUnavailableException("Participant not ready"));
 		return bootstrap.state().compose(binding -> {
-			if (!binding.installed()) return Future.failedFuture("Cluster admission is pending");
+			if (!binding.installed()) return Future.failedFuture(new RaftUnavailableException("Cluster admission is pending"));
 			return attachedNode.membershipView().map(view -> new MemberStatus(identity, binding.genesis(),
 				view.leadership().term(), view.leadership().leaderId(), view.leadership().leader(), view.membership().effective()));
 		});
@@ -443,7 +445,7 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 		final List<NodeEndpoint> copy = List.copyOf(endpoints);
 		return ContextDispatch.call(context, () -> {
 			ensureListening();
-			if (copy.size() > MAX_IN_FLIGHT) return Future.failedFuture("At most 64 discovery endpoints are supported");
+			if (copy.size() > MAX_IN_FLIGHT) throw new IllegalArgumentException("At most 64 discovery endpoints are supported");
 			Promise<DiscoveryResult> result = ContextDispatch.promise(context);
 			peers.discover(copy, this::identify, result);
 			return result.future();
@@ -463,7 +465,7 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 				|| (!learnerAdmission && !genesis.voters().contains(identity.nodeId()))
 				|| (bootstrap == null && !Objects.equals(clusterId, genesis.clusterId()))
 				|| (bootstrap != null && !bootstrap.authorityId().equals(genesis.authorityId()))) {
-				return Future.failedFuture("Transport policy conflicts with local cluster binding");
+				throw new IllegalStateException("Transport policy conflicts with local cluster binding");
 			}
 			return Future.succeededFuture();
 		});
@@ -477,11 +479,11 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 	@Override public Future<Void> send(RaftElection.Envelope envelope) {
 		return ContextDispatch.call(context, () -> refreshBinding().compose(v -> {
 			ensureListening();
-			if (!installed || clusterId == null) return Future.failedFuture("Bootstrap installation is required");
+			if (!installed || clusterId == null) return Future.failedFuture(new RaftUnavailableException("Bootstrap installation is required"));
 			if (!identity.nodeId().equals(envelope.from()) || !identity.groupName().equals(envelope.groupName())
-				|| !clusterId.equals(envelope.clusterId())) return Future.failedFuture("Foreign outbound envelope");
+				|| !clusterId.equals(envelope.clusterId())) throw new IllegalArgumentException("Foreign outbound envelope");
 			NodeEndpoint endpoint = peers.endpoint(envelope.to());
-			if (endpoint == null) return Future.failedFuture("No verified route for " + envelope.to());
+			if (endpoint == null) return Future.failedFuture(new RaftUnavailableException("No verified route for " + envelope.to()));
 			return this.<Void>request(endpoint, (connection, completion) -> connection.send(envelope, completion));
 		}));
 	}
@@ -564,28 +566,38 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 
 	private void receiveProtocol(String peer, RaftElection.Envelope envelope, RaftRequestCompletion<Void> completion) {
 		whenBound(() -> {
-			if (!installed || clusterId == null || !peer.equals(envelope.from()) || !identity.nodeId().equals(envelope.to())
+			if (!installed || clusterId == null) {
+				completion.fail(new RaftUnavailableException("Bootstrap installation is required")); return;
+			}
+			if (!peer.equals(envelope.from()) || !identity.nodeId().equals(envelope.to())
 				|| !identity.groupName().equals(envelope.groupName()) || !clusterId.equals(envelope.clusterId())) {
-				completion.fail("Protocol identity or cluster mismatch"); return;
+				completion.fail(new SecurityException("Protocol identity or cluster mismatch")); return;
 			}
 			receiver.apply(envelope).onComplete(completion);
 		}, completion);
 	}
 
 	private void receiveJoin(String peer, JoinRequest join, RaftRequestCompletion<MemberStatus> completion) {
-		if (closed || admissionHandler == null || !peer.equals(join.identity().nodeId())
+		if (closed) { completion.fail(new CancellationException("Transport closed")); return; }
+		if (admissionHandler == null) {
+			completion.fail(new RaftUnavailableException("Admission is unavailable")); return;
+		}
+		if (!peer.equals(join.identity().nodeId())
 			|| !identity.groupName().equals(join.identity().groupName())) {
-			completion.fail("Admission closed or sender/group mismatch"); return;
+			completion.fail(new SecurityException("Admission sender/group mismatch")); return;
 		}
 		admissionHandler.apply(join).onComplete(completion);
 	}
 
 	private void receiveLeave(String peer, LeaveRequest leaving, RaftRequestCompletion<LeaveResult> completion) {
 		whenBound(() -> {
-			if (leaveHandler == null || !installed || !peer.equals(leaving.identity().nodeId())
+			if (leaveHandler == null || !installed) {
+				completion.fail(new RaftUnavailableException("Removal is unavailable")); return;
+			}
+			if (!peer.equals(leaving.identity().nodeId())
 				|| !identity.groupName().equals(leaving.identity().groupName())
 				|| !Objects.equals(clusterId, leaving.clusterId())) {
-				completion.fail("Leave sender/group/cluster mismatch"); return;
+				completion.fail(new SecurityException("Leave sender/group/cluster mismatch")); return;
 			}
 			leaveHandler.apply(leaving).onComplete(completion);
 		}, completion);
@@ -594,13 +606,13 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 	private void receiveGenesis(String peer, Void ignored, RaftRequestCompletion<RaftGenesis> completion) {
 		bootstrap.state().onComplete(result -> {
 			if (result.failed()) completion.fail(result.cause());
-			else if (result.result().genesis() == null) completion.fail("Bootstrap pending");
+			else if (result.result().genesis() == null) completion.fail(new RaftUnavailableException("Bootstrap pending"));
 			else completion.succeed(result.result().genesis());
 		});
 	}
 
 	private void receiveInstallation(String peer, RaftGenesis genesis, RaftRequestCompletion<Void> completion) {
-		if (closed) { completion.fail("Bootstrap closed"); return; }
+		if (closed) { completion.fail(new CancellationException("Bootstrap closed")); return; }
 		bootstrap.install(genesis, peer).onComplete(installed -> {
 			if (installed.failed()) completion.fail(installed.cause()); else refreshBinding().onComplete(completion);
 		});
@@ -609,8 +621,8 @@ public final class HttpRaftTransport implements RaftClusterTransport {
 	private void whenBound(Runnable action, RaftRequestCompletion<?> completion) {
 		refreshBinding().onComplete(result -> {
 			if (result.failed()) completion.fail(result.cause());
-			else if (!completion.isActive()) completion.fail("Request expired");
-			else if (closed) completion.fail("Transport closed");
+			else if (!completion.isActive()) completion.fail(new CancellationException("Request expired"));
+			else if (closed) completion.fail(new CancellationException("Transport closed"));
 			else try { action.run(); } catch (Exception e) { completion.fail(e); }
 		});
 	}

@@ -25,7 +25,7 @@ final class ContextDispatch {
 		context.runOnContext(ignored -> {
 			try {
 				operation.get().onComplete(result);
-			} catch (Exception e) {
+			} catch (Throwable e) {
 				result.tryFail(e);
 			}
 		});

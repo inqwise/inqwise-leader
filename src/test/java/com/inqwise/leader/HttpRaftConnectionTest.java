@@ -86,6 +86,27 @@ class HttpRaftConnectionTest {
 		assertEquals(1, completions.get());
 	}
 
+	@Test void retryablePeerStatusesAreStacklessAndOtherProtocolFailuresKeepDiagnostics() throws Exception {
+		var status = new AtomicInteger(425);
+		var server = await(vertx.createHttpServer(serverOptions("node-b")).requestHandler(request ->
+			request.response().putHeader(HttpRaftClient.NODE_HEADER, "node-b").setStatusCode(status.get()).end()).listen());
+		var connection = client(5000).connection(new NodeEndpoint("127.0.0.1", server.actualPort(), "node-b"));
+		try {
+			for (int code : List.of(425, 429, 503, 400)) {
+				status.set(code); var result = Promise.<RaftWireCodec.PeerIdentity>promise();
+				context.runOnContext(ignored -> connection.identify(result));
+				assertThrows(Exception.class, () -> await(result.future()));
+				if (code == 400) {
+					assertInstanceOf(java.io.IOException.class, result.future().cause());
+					assertTrue(result.future().cause().getStackTrace().length > 0);
+				} else {
+					assertInstanceOf(RaftUnavailableException.class, result.future().cause());
+					assertEquals(0, result.future().cause().getStackTrace().length);
+				}
+			}
+		} finally { await(server.close()); }
+	}
+
 	@Test void oversizedResponseIsRejectedAndDoesNotConsumeTheNextRequestSlot() throws Exception {
 		var count = new AtomicInteger();
 		var server = await(vertx.createHttpServer(serverOptions("node-b")).requestHandler(request -> {
@@ -142,19 +163,23 @@ class HttpRaftConnectionTest {
 		var client = client(5000);
 		RaftConnection connection = client.connection(new NodeEndpoint("127.0.0.1", server.actualPort(), "node-b"));
 		var completions = new AtomicInteger(); var first = Promise.<Void>promise();
+		var cancellation = new java.util.concurrent.atomic.AtomicReference<Throwable>();
 		await(ContextDispatch.call(context, () -> {
 			connection.identify((value, failure) -> {
 				completions.incrementAndGet();
-				if (failure == null) first.tryFail("Expected cancellation"); else first.tryComplete();
+				if (failure == null) first.tryFail("Expected cancellation");
+				else { cancellation.set(failure); first.tryComplete(); }
 			});
 			return Future.succeededFuture();
 		}));
 		await(received.future());
 		await(ContextDispatch.call(context, client::close));
 		await(first.future());
+		assertInstanceOf(java.util.concurrent.CancellationException.class, cancellation.get());
 		var after = Promise.<RaftWireCodec.PeerIdentity>promise();
 		context.runOnContext(ignored -> connection.identify(after));
 		assertThrows(Exception.class, () -> await(after.future()));
+		assertInstanceOf(java.util.concurrent.CancellationException.class, after.future().cause());
 		assertEquals(1, completions.get());
 	}
 }

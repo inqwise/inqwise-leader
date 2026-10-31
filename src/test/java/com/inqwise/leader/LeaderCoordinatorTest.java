@@ -160,6 +160,23 @@ class LeaderCoordinatorTest {
 		await(coordinator.close());
 	}
 
+	@Test void typedFailuresDistinguishPendingParticipationFromInvalidLifecycleUsage() throws Exception {
+		var vertx = runtime(); var coordinator = create(vertx, options("node-a", availablePort(vertx)), null);
+		var pending = assertDoesNotThrow(coordinator::participant);
+		assertThrows(Exception.class, () -> await(pending));
+		assertInstanceOf(RaftUnavailableException.class, pending.cause());
+		assertEquals(0, pending.cause().getStackTrace().length);
+		var invalid = assertDoesNotThrow(() -> coordinator.leave(0));
+		assertThrows(Exception.class, () -> await(invalid));
+		assertInstanceOf(IllegalArgumentException.class, invalid.cause());
+		assertTrue(invalid.cause().getStackTrace().length > 0);
+		await(coordinator.close());
+		var closed = assertDoesNotThrow(() -> coordinator.listen(8080));
+		assertThrows(Exception.class, () -> await(closed));
+		assertInstanceOf(IllegalStateException.class, closed.cause());
+		assertTrue(closed.cause().getStackTrace().length > 0);
+	}
+
 	@Test void plaintextSingletonBecomesReadyAndRecoversWithoutCertificatesOrExplicitIdentity() throws Exception {
 		var vertx = runtime(); var config = options("node-a", availablePort(vertx));
 		var first = create(vertx, config, null);

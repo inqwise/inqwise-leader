@@ -78,20 +78,20 @@ public final class RaftBootstrap {
 	public Future<RaftGenesis> form(List<DiscoveredPeer> peers) {
 		var copy = List.copyOf(peers);
 		return ContextDispatch.call(context(), () -> store.identity().compose(identity -> {
-			if (!authorityId.equals(identity.nodeId())) return Future.failedFuture("Only the designated authority can form genesis");
+			if (!authorityId.equals(identity.nodeId())) throw new IllegalStateException("Only the designated authority can form genesis");
 			return state().compose(binding -> {
 				if (binding.genesis() != null) return Future.succeededFuture(binding.genesis());
-				if (copy.size() > 64) return Future.failedFuture("Too many bootstrap candidates");
+				if (copy.size() > 64) throw new IllegalArgumentException("Too many bootstrap candidates");
 				var eligible = new TreeSet<String>(); eligible.add(identity.nodeId());
 				var endpoints = new HashMap<String, NodeEndpoint>();
 				for (var peer : copy) {
 					if (!identity.groupName().equals(peer.identity().groupName()) || peer.clusterId() != null) {
-						return Future.failedFuture("Bootstrap conflict: candidate is assigned or belongs to another group");
+						throw new SecurityException("Bootstrap conflict: candidate is assigned or belongs to another group");
 					}
 					if (peer.departing()) continue;
 					var previous = endpoints.putIfAbsent(peer.identity().nodeId(), peer.endpoint());
 					if (previous != null && (!previous.host().equals(peer.endpoint().host())
-						|| previous.port() != peer.endpoint().port())) return Future.failedFuture("Conflicting candidate identity");
+						|| previous.port() != peer.endpoint().port())) throw new SecurityException("Conflicting candidate identity");
 					eligible.add(peer.identity().nodeId());
 				}
 				return store.createGenesis(eligible, target);
@@ -108,7 +108,7 @@ public final class RaftBootstrap {
 	public Future<Void> install(RaftGenesis genesis, String authenticatedAuthority) {
 		return ContextDispatch.call(context(), () -> {
 			if (!authorityId.equals(authenticatedAuthority) || !authorityId.equals(genesis.authorityId())) {
-				return Future.failedFuture("Bootstrap authority authentication mismatch");
+				throw new SecurityException("Bootstrap authority authentication mismatch");
 			}
 			return state().compose(v -> store.installGenesis(genesis));
 		});

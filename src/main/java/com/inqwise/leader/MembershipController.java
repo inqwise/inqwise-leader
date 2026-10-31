@@ -92,7 +92,7 @@ public final class MembershipController {
 	private long leaveDeadline = -1;
 	private boolean finishingLeave;
 	private Throwable lastLeaveError;
-	private Future<Void> passWork = Future.succeededFuture();
+	private Future<Void> passWork;
 
 	/**
 	 * Creates a controller with default local timing and bounds.
@@ -155,7 +155,7 @@ public final class MembershipController {
 	public Future<Void> snapshotHandlers(Function<RaftElection.SnapshotPoint, Future<String>> provider,
 		Function<RaftSnapshot, Future<Void>> restorer, Handler<RaftLogEntry> committed) {
 		return ContextDispatch.call(context, () -> {
-			if (status != Status.NEW) return Future.failedFuture("Register snapshot hooks before startup");
+			if (status != Status.NEW) throw new IllegalStateException("Register snapshot hooks before startup");
 			snapshotProvider = Objects.requireNonNull(provider, "provider");
 			snapshotRestorer = Objects.requireNonNull(restorer, "restorer");
 			committedHandler = Objects.requireNonNull(committed, "committed");
@@ -173,14 +173,14 @@ public final class MembershipController {
 
 	private Future<Void> startOnContext() {
 		if (starting != null && (status == Status.STARTING || status == Status.RUNNING)) return starting.future();
-		if (status != Status.NEW) return Future.failedFuture("Create a new controller after close");
+		if (status != Status.NEW) throw new IllegalStateException("Create a new controller after close");
 		status = Status.STARTING; long epoch = ++generation;
 		starting = ContextDispatch.promise(context);
 		store.open().compose(v -> store.identity()).compose(recovered -> {
 			check(epoch); identity = recovered;
 			if (options.advertisedEndpoint() != null && options.advertisedEndpoint().expectedNodeId() != null
 				&& !identity.nodeId().equals(options.advertisedEndpoint().expectedNodeId())) {
-				return Future.failedFuture("Advertised identity differs from persisted identity");
+				throw new IllegalStateException("Advertised identity differs from persisted identity");
 			}
 			return transport.listen();
 		}).compose(v -> transport.admissionHandler(this::admit))
@@ -199,7 +199,7 @@ public final class MembershipController {
 	 */
 	public Future<VertxLeaderNode> participant() {
 		return ContextDispatch.call(context, () -> (status == Status.RUNNING || status == Status.LEAVING) && node != null
-			? Future.succeededFuture(node) : Future.failedFuture("Participant is not ready"));
+			? Future.succeededFuture(node) : Future.failedFuture(new RaftUnavailableException("Participant is not ready")));
 	}
 
 	/**
@@ -221,9 +221,9 @@ public final class MembershipController {
 	}
 
 	private Future<Void> leaveOnContext(long timeoutMillis) {
-		if (timeoutMillis <= 0) return Future.failedFuture("A positive leave deadline is required");
+		if (timeoutMillis <= 0) throw new IllegalArgumentException("A positive leave deadline is required");
 		if (leaving != null) return leaving.future();
-		if (status != Status.RUNNING) return Future.failedFuture("A running controller is required");
+		if (status != Status.RUNNING) throw new IllegalStateException("A running controller is required");
 		status = Status.LEAVING; generation++;
 		if (timer != -1) { context.owner().cancelTimer(timer); timer = -1; }
 		leaving = ContextDispatch.promise(context);
@@ -235,7 +235,8 @@ public final class MembershipController {
 		});
 		Future<Void> drained = node == null ? Future.succeededFuture() : node.drain();
 		drained.compose(v -> transport.beginLeave())
-			.compose(v -> node == null ? passWork.recover(cause -> Future.succeededFuture()) : Future.succeededFuture())
+			.compose(v -> node == null && passWork != null
+				? passWork.recover(cause -> Future.succeededFuture()) : Future.succeededFuture())
 			.onComplete(result -> {
 			if (status != Status.LEAVING || finishingLeave) return;
 			if (result.failed()) finishLeave(result.cause()); else attemptLeave();
@@ -287,10 +288,10 @@ public final class MembershipController {
 	private void attemptLeave() {
 		if (status != Status.LEAVING || finishingLeave) return;
 		store.bootstrapState().compose(binding -> {
-			if (status != Status.LEAVING) return Future.failedFuture("Leave canceled");
+			if (status != Status.LEAVING) throw new CancellationException("Leave canceled");
 			if (binding.genesis() == null) return Future.<LeaveResult>succeededFuture();
-			if (!binding.installed()) return Future.failedFuture("Prepared genesis exists; removal is unconfirmed");
-			if (node == null) return Future.failedFuture("Participant not ready; removal is unconfirmed");
+			if (!binding.installed()) return Future.failedFuture(new RaftUnavailableException("Prepared genesis exists; removal is unconfirmed"));
+			if (node == null) return Future.failedFuture(new RaftUnavailableException("Participant not ready; removal is unconfirmed"));
 			return node.controlMembershipView().compose(view -> {
 				if (view.leadership().leader()) {
 					return removeDeparting(new LeaveRequest(identity, binding.genesis().clusterId(), view.leadership().term()), true);
@@ -315,14 +316,14 @@ public final class MembershipController {
 	}
 
 	private Future<NodeEndpoint> findLeaveLeader(List<NodeEndpoint> candidates, RaftGenesis genesis) {
-		if (candidates.isEmpty()) return Future.failedFuture("No known leader endpoints");
+		if (candidates.isEmpty()) return Future.failedFuture(new RaftUnavailableException("No known leader endpoints"));
 		var found = ContextDispatch.<NodeEndpoint>promise(context); int[] remaining = {candidates.size()};
 		for (var candidate : candidates) transport.memberStatus(candidate).onComplete(observed -> {
-			if (status != Status.LEAVING || finishingLeave) { found.tryFail("Leave canceled"); return; }
+			if (status != Status.LEAVING || finishingLeave) { found.tryFail(new CancellationException("Leave canceled")); return; }
 			if (observed.succeeded() && observed.result().ready() && observed.result().genesis().equals(genesis)) {
 				found.tryComplete(candidate);
 			}
-			if (--remaining[0] == 0) found.tryFail("No ready leader for graceful removal");
+			if (--remaining[0] == 0) found.tryFail(new RaftUnavailableException("No ready leader for graceful removal"));
 		});
 		return found.future();
 	}
@@ -330,17 +331,17 @@ public final class MembershipController {
 	private Future<LeaveResult> removeDeparting(LeaveRequest request, boolean local) {
 		long epoch = generation;
 		if (node == null || admissionSuspended || (local ? status != Status.LEAVING : status != Status.RUNNING)) {
-			return Future.failedFuture("Removal is unavailable");
+			return Future.failedFuture(new RaftUnavailableException("Removal is unavailable"));
 		}
 		return store.bootstrapState().compose(binding -> {
 			if (!request.identity().groupName().equals(identity.groupName())
-				|| !request.clusterId().equals(binding.genesis().clusterId())) return Future.failedFuture("Leave binding mismatch");
+				|| !request.clusterId().equals(binding.genesis().clusterId())) throw new SecurityException("Leave binding mismatch");
 			return node.controlMembershipView();
 		}).compose(view -> {
 			if (epoch != generation || (local ? status != Status.LEAVING : status != Status.RUNNING)
 				|| !view.leadership().leader() || view.leadership().term() != request.leaderTerm() || view.busy()
 				|| view.membership().effective().joint() || view.membership().configurationIndex() > view.commitIndex()) {
-				return Future.failedFuture("A settled ready leader in the requested term is required");
+				return Future.failedFuture(new RaftUnavailableException("A settled ready leader in the requested term is required"));
 			}
 			String departing = request.identity().nodeId(); var configuration = view.membership().effective();
 			Future<?> removal;
@@ -356,7 +357,7 @@ public final class MembershipController {
 						.filter(view.responsiveMembers()::contains)
 						.filter(id -> view.matchIndex().getOrDefault(id, 0L) >= view.commitIndex()).sorted().findFirst()
 						.ifPresent(desired::add);
-					if (desired.isEmpty()) return Future.failedFuture("The final voter needs a caught-up replacement");
+					if (desired.isEmpty()) return Future.failedFuture(new RaftUnavailableException("The final voter needs a caught-up replacement"));
 					removal = node.changeVoters(desired, request.leaderTerm(), view.membership().configurationIndex());
 				}
 			}
@@ -381,6 +382,7 @@ public final class MembershipController {
 			try { work = pass(epoch); } catch (Exception e) { work = Future.failedFuture(e); }
 			passWork = work;
 			work.onComplete(result -> context.runOnContext(v -> {
+				passWork = null;
 				if (status != Status.RUNNING || epoch != generation) return;
 				if (result.failed()) report(result.cause());
 				schedule(epoch, options.refreshIntervalMillis());
@@ -417,14 +419,14 @@ public final class MembershipController {
 		Set<String> clusters = new HashSet<>(found.conflicts());
 		for (var peer : found.peers()) if (peer.clusterId() != null) clusters.add(peer.clusterId());
 		if (clusters.size() > 1 || !found.conflicts().isEmpty()) {
-			admissionSuspended = true; return Future.failedFuture("Conflicting cluster identities");
+			admissionSuspended = true; throw new IllegalStateException("Conflicting cluster identities");
 		}
 		admissionSuspended = false;
 		return store.bootstrapState().compose(binding -> {
 			check(epoch);
 			if (node == null && binding.genesis() != null) retainedMembers = binding.genesis().voters();
 			if (binding.genesis() != null && !clusters.isEmpty() && !clusters.contains(binding.genesis().clusterId())) {
-				return Future.failedFuture("Discovered cluster differs from durable genesis");
+				throw new IllegalStateException("Discovered cluster differs from durable genesis");
 			}
 			if (binding.installed()) return ensureParticipant(epoch)
 				.compose(v -> maintainInstalledMembership(epoch, binding.genesis(), found.peers()));
@@ -483,7 +485,7 @@ public final class MembershipController {
 			check(epoch);
 			MemberStatus leader = null; NodeEndpoint endpoint = null;
 			for (int i = 0; i < statuses.size(); i++) if (statuses.get(i).succeeded() && statuses.get(i).result().ready()) {
-				if (leader != null) return Future.failedFuture("Multiple ready leader claims; admission suspended");
+				if (leader != null) throw new IllegalStateException("Multiple ready leader claims; admission suspended");
 				leader = statuses.get(i).result(); endpoint = assigned.get(i).endpoint();
 			}
 			if (leader == null) return Future.succeededFuture();
@@ -505,7 +507,7 @@ public final class MembershipController {
 	private Future<Void> ensureParticipant(long epoch) {
 		check(epoch); if (node != null) return Future.succeededFuture();
 		return VertxLeaderNode.fromStore(store, timing, random, transport).compose(created -> {
-			if (epoch != generation || status != Status.RUNNING) return created.close().compose(v -> Future.failedFuture("Controller closed"));
+			if (epoch != generation || status != Status.RUNNING) return created.close().compose(v -> { throw new CancellationException("Controller closed"); });
 			node = created; node.exceptionHandler(this::report); node.leadershipHandler(value -> {
 				if (status == Status.RUNNING) emitLeadership(value);
 			});
@@ -552,7 +554,7 @@ public final class MembershipController {
 			return transport.verifyPeer(new NodeEndpoint(join.endpoint().host(), join.endpoint().port(), join.identity().nodeId()));
 		}).compose(peer -> {
 			check(epoch);
-			if (peer.departing() || departureEpoch != departureGeneration) return Future.failedFuture("Departure superseded admission");
+			if (peer.departing() || departureEpoch != departureGeneration) return Future.failedFuture(new CancellationException("Departure superseded admission"));
 			departures.remove(join.identity().nodeId());
 			return node.membershipView().compose(current -> {
 				checkAdmission(current, join);
@@ -560,7 +562,7 @@ public final class MembershipController {
 					var genesis = binding.genesis();
 					if ((genesis.voters().contains(join.identity().nodeId()) && join.clusterId() == null) || (join.clusterId() != null
 						&& !join.clusterId().equals(genesis.clusterId())) || (peer.clusterId() != null
-						&& !peer.clusterId().equals(genesis.clusterId()))) return Future.failedFuture("Incompatible cluster/initial voter admission");
+						&& !peer.clusterId().equals(genesis.clusterId()))) throw new SecurityException("Incompatible cluster/initial voter admission");
 					Future<?> committed = current.membership().effective().learners().contains(join.identity().nodeId())
 						? Future.succeededFuture() : node.addLearner(join.identity().nodeId(), join.leaderTerm(), current.membership().configurationIndex());
 					return committed.compose(v -> { check(epoch); return transport.localMemberStatus(); }).map(status -> {
@@ -580,7 +582,7 @@ public final class MembershipController {
 			|| (!view.membership().effective().learners().contains(join.identity().nodeId())
 				&& (view.membership().effective().learners().size() >= options.maxLearners()
 					|| view.membership().effective().members().size() >= RaftConfiguration.MAX_MEMBERS))) {
-			throw new IllegalStateException("Leader is not accepting this learner admission");
+			throw new RaftUnavailableException("Leader is not accepting this learner admission");
 		}
 	}
 

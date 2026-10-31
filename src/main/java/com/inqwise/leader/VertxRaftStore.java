@@ -467,7 +467,7 @@ public final class VertxRaftStore implements AsyncRaftStore {
 			if (closing) {
 				result.tryFail(new IllegalStateException("Store is closing or closed"));
 			} else if (operations.size() >= MAX_QUEUED_OPERATIONS) {
-				result.tryFail(new IllegalStateException("Store operation queue is full"));
+				result.tryFail(new RaftUnavailableException("Store operation queue is full"));
 			} else {
 				enqueue(operation, result);
 			}

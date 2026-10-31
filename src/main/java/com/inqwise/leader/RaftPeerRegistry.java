@@ -9,6 +9,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.LongSupplier;
 
+import java.util.concurrent.CancellationException;
+
 import io.vertx.core.Completable;
 
 /** Owner-context verified routes and callback-only discovery aggregation. Never decides voting membership. */
@@ -55,7 +57,8 @@ final class RaftPeerRegistry {
 	void discover(List<NodeEndpoint> endpoints, BiConsumer<NodeEndpoint, Completable<DiscoveredPeer>> probe,
 		Completable<RaftClusterTransport.DiscoveryResult> completion) {
 		if (closed || endpoints.size() > limit) {
-			completion.fail(closed ? "Transport closed" : "Too many discovery endpoints"); return;
+			completion.fail(closed ? new CancellationException("Transport closed")
+				: new IllegalArgumentException("Too many discovery endpoints")); return;
 		}
 		var distinct = endpoints.stream().distinct().toList();
 		var pass = new Pass(++generation, distinct.size(), completion);
@@ -105,7 +108,8 @@ final class RaftPeerRegistry {
 			var callback = completion; completion = null;
 			if (closed || epoch != generation) {
 				peers.clear(); failures.clear(); conflicts.clear(); clusterConflicts.clear();
-				callback.fail(closed ? "Transport closed" : "Discovery superseded by a newer refresh"); return;
+				callback.fail(new CancellationException(
+					closed ? "Transport closed" : "Discovery superseded by a newer refresh")); return;
 			}
 			for (String id : conflicts) { routes.remove(id); peers.remove(id); quarantined.add(id); }
 			if (quarantined.size() > limit) quarantined.retainAll(conflicts);
