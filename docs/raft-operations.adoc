@@ -1,0 +1,156 @@
+= Raft Deployment and Recovery
+
+This guide covers the opt-in `LeaderCoordinator` workspace API.
+The API is unreleased; the existing `LeaderConsensus` API uses a separate protocol and storage model.
+See link:../README.adoc#raft-quick-start[the coordinator quick start] for Java assembly and
+link:raft-design.adoc[the design] for protocol contracts and test evidence.
+
+== Prepare a group
+
+Use the same `groupName`, `bootstrapAuthorityId`, discovery source and initial `targetVoterCount` across participants.
+The default target is three; only selected members vote. Additional application instances can be standby learners or observers.
+Targets must be odd, from 1 through 63. A stable three-voter configuration needs two votes; five needs three;
+seven needs four; nine needs five. During a joint transition, both old and new voter sets need their own majority.
+The effective replicated configuration determines quorum, including when a graceful departure temporarily leaves fewer voters.
+
+Give each node a distinct persistent directory and identity. For provisioned certificates, configure an explicit readable
+`nodeId`, such as `node-a`, matching its certificate URI SAN `urn:inqwise:leader:node:node-a`.
+The directory retains identity, immutable genesis, term/vote, log, commit index and snapshot.
+Keep it across application restarts and machine replacement when the original durable storage is available.
+Never run copies of one identity concurrently, including copies on different machines: the directory lock protects only
+access to that directory and cannot detect a copied identity on another host.
+
+Bind with `listen()` (127.0.0.1:8080), `listen(port)`, or `listen(port, host)`.
+Omitted static discovery ports default to 8080 independently of the listening port.
+Use distinct ports and explicit directories for multiple processes on one machine.
+Binding `0.0.0.0` requires a concrete `advertisedEndpoint` reachable by peers.
+Use static `ipv4[:port][#expectedNodeId]` endpoints or SRV discovery; SRV supplies its own port and resolves IPv4 addresses.
+Discovery supplies contact addresses. The identity handshake reports persisted node identity;
+mutual TLS additionally authenticates that identity against a certificate.
+DNS changes alone never change the voter set or quorum.
+
+The two simpler coordinator factories use plaintext and accept self-reported identities for trusted development networks.
+The zero-configuration factory is a local one-voter preset; explicit options still default to three voters.
+For authenticated deployment, provision server and client TLS credentials for each identity, with the listener IP SAN for hostname verification.
+Configure mutual trust for the group's authorized peers using standard Vert.x HTTP TLS options.
+Keep production credentials separate from the repository's test fixtures.
+The protocol assumes non-Byzantine participants authorized by that trust policy.
+
+== Bootstrap once
+
+. Start the designated authority and enough reachable eligible nodes to meet the initial target.
+  Empty discovery with target three leaves formation pending; use target one explicitly for single-node development.
+. Let the authority persist the original genesis and install it on selected initial voters.
+  Register leadership and exception handlers before calling `listen()`.
+. Wait for a `Leadership` observation with `leader() == true` before starting leader work.
+  Successful `listen()` only confirms local startup; it does not confirm formation, voter admission or readiness.
+. Record the cluster ID, authority identity and original genesis alongside deployment inventory.
+  Preserve the authority's directory with the other durable node state.
+
+Once genesis exists, it wins over later local changes to the target setting.
+Changing JSON cannot resize an initialized group's desired target or create a new genesis for that group.
+Healthy voters remain selected when more nodes arrive; the controller admits bounded standby learners and promotes caught-up
+members as needed. The default replacement delay is 30 seconds, and replacement still requires an available quorum.
+
+Never start an empty directory under an established group's authority identity to repair lost storage.
+That can create a different cluster ID while surviving participants retain the original cluster.
+The implementation rejects conflicting bindings; it does not merge independently bootstrapped clusters.
+
+== Application lifecycle and checkpoints
+
+Compose startup and shutdown with Vert.x futures on the application lifecycle.
+Synchronous `create()` accepts immutable options and copies HTTP settings without acquiring resources.
+Register handlers, then compose `listen()`.
+Retain the coordinator and eventually call `leave()` or `close()` after starting it. Closing an unopened instance is safe.
+Read `identity()` after successful startup; storage recovery determines the persisted identity.
+The coordinator owns its HTTP, store and SRV DNS resources; the application owns its Vert.x instance.
+Do not block an event loop while waiting for startup, replication, checkpointing or shutdown.
+Unregistered coordinator exception handlers default to `Throwable::printStackTrace` on the owner context;
+`exceptionHandler(null)` restores that default. A custom handler replaces it. Handle failed operation futures separately.
+
+Stop initiating leader work when leadership becomes false. Use a custom exception handler for application-specific error policy;
+retryable discovery errors do not themselves revoke readiness or stop application jobs.
+Readiness uses recent quorum responses and a durable current-term commit; it is a local observation, not an external-work lease.
+A paused or disconnected process may still have work in flight when another leader takes over.
+An external destination needs its own enforced fencing/idempotency contract before claiming exclusive side effects.
+`fencingToken()` supplies a coherent ready group/cluster/term observation. The destination must enforce it atomically.
+See link:raft-fencing.adoc[Application fencing] for the tested example, persistence requirements and cluster-binding rules.
+
+Coordination-only deployments need no application snapshot hooks.
+For replicated DATA, register committed-entry delivery and asynchronous checkpoint/restore hooks before `listen()`.
+Checkpoint the exact requested committed point and make restoration idempotent.
+Recovery restores the snapshot before replaying retained committed entries; delivery can repeat after a restart.
+Deduplicate application operations and handle uncertain proposal outcomes: a failed or timed-out proposal can still commit.
+Automatic compaction cannot discard new DATA without the application checkpoint hooks; the retained log has finite bounds.
+
+== Restart and maintenance
+
+For an ordinary restart, stop the process and reopen the same directory with the same group, identity and authority settings.
+The node recovers its durable state before discovery and catches up from the current leader as required.
+An established cluster can elect without the original authority online when surviving voters form quorum.
+A full-cluster restart uses the existing directories; it is not a new bootstrap.
+
+For temporary maintenance, `close()` shuts down locally without promising membership removal.
+Maintain quorum among remaining voters and restart with retained storage.
+For deliberate departure, compose `leave()` and wait for success before considering removal confirmed.
+It drains application readiness immediately, requests committed removal and closes local resources.
+The default membership deadline is 30 seconds; resource cleanup can take longer while accepted I/O completes.
+A failed or timed-out leave has an uncertain removal outcome. Inspect current committed membership before proceeding.
+
+Maintain one node at a time, waiting for readiness, catch-up and any membership transition to settle before the next stop.
+Automatic replacement may change membership during a long outage. A returning removed node with compatible retained state
+requests learner admission again rather than regaining a vote through discovery.
+The final voter cannot leave successfully without a caught-up replacement.
+Stop a deliberately departed controller; restarting it can seek admission again.
+
+== Lost or corrupt node storage with quorum available
+
+. Stop the affected process and retain the failed directory for diagnosis.
+  Missing marked state and checksum corruption fail closed; do not delete `initialized` or edit the binary state to bypass this.
+. Confirm that the surviving group still has a ready leader and enough effective voters for quorum.
+. Provision a replacement with a fresh identity, matching TLS credentials and a fresh directory.
+  Use the established group/authority settings and discovery source, without reusing the lost voter identity.
+. Let the current leader commit learner admission, catch-up and voter replacement.
+  The controller's failure delay and joint consensus still apply; adding a process cannot bypass quorum.
+. Confirm settled committed membership and application readiness before retiring the failed node's artifacts.
+
+If intact original durable storage is recovered instead, restart that identity from those retained files only after ensuring
+that no other process is using the identity. Do not reconstruct its term, vote or configuration from deployment settings.
+
+== Backups and permanent quorum loss
+
+For an archival copy, first close the local coordinator successfully and ensure no process owns or modifies the directory.
+Copy the complete closed directory, including the initialization marker and durable state container, with deployment/TLS
+inventory and any application state required to interpret its checkpoint. Do not treat a copy taken during writes as a
+supported consistent backup. Retain the original files when diagnosing a failure.
+
+A backup is historical evidence, not permission to roll back a voter that has since advanced.
+Restoring an older term/vote or membership can violate protocol assumptions even if the file checksum is valid.
+There is no supported backup-restore command, force-quorum option, lost-authority rebootstrap or disaster-recovery API yet.
+Backup media and restore procedures need separate deployment acceptance tests before relying on them for recovery.
+
+If quorum is permanently lost, stop leader work and preserve every surviving directory.
+First recover original up-to-date voter storage and connectivity where possible.
+Changing DNS, lowering `targetVoterCount`, copying one survivor into several directories, or deleting genesis cannot restore quorum.
+Do not resume an established authority from an empty directory.
+If original quorum cannot be recovered, operator-led creation of a replacement cluster is a separate application migration:
+isolate all old participants, reconcile application data and uncertain operations, and establish a new external fencing boundary
+before enabling work. This migration is not automated or validated by the current API.
+
+== Upgrade and deployment acceptance
+
+Use matching protocol builds across the group. The current workspace HTTP wire version is 4 and store version is 5;
+these numbers are distinct. Older store decoding is not a promise of binary downgrade or rolling wire compatibility.
+Use a coordinated stop/start with retained directories for incompatible wire changes.
+Plan a separate application handover from legacy `LeaderConsensus` so the two protocols cannot independently run the same work.
+
+Before enabling a deployment, exercise its actual TLS identities, discovery, storage filesystem, shutdown deadlines and
+application checkpoint/restore hooks. Verify leader failure, minority demotion, full restart with retained storage and
+replacement of a lost node while quorum survives. Verify destination-side fencing for in-flight external work separately.
+Observe leadership/exception handlers and authenticated membership information; no metrics exporter or operator recovery CLI
+is supplied by the coordinator.
+
+`mvn test -Dtest=RaftProcessTest` covers separate-JVM failure and recovery paths using test TLS and the host filesystem.
+The full Maven suite adds deterministic protocol simulation and in-process integration checks.
+These tests establish process-crash evidence; physical power loss, storage-controller behavior, operational backup restoration
+and external destination fencing require additional acceptance evidence.

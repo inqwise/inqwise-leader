@@ -1,0 +1,1101 @@
+= Raft Coordination Design
+
+Status: implementation proposal, following the project design discussion.
+The foundation types, fixed-membership election/replication core, and Vert.x storage/runtime adapters below
+are implemented in the workspace.
+Authenticated HTTP transport and static/SRV endpoint discovery are also implemented.
+Durable cluster/genesis binding and authenticated designated-authority bootstrap are implemented.
+Joint voter transitions and learner catch-up are implemented as explicit operations.
+Automatic discovery, leader-authorized learner admission, and delayed voter replacement are implemented.
+Durable snapshots, log compaction and snapshot-based learner catch-up are implemented.
+Graceful network leave with bounded removal confirmation is implemented.
+High-level JSON/builder configuration and the owning LeaderCoordinator facade are implemented.
+Ready leadership fencing tokens and a compiled destination example with delayed-write tests are implemented.
+The milestones below document the implemented Raft APIs and HTTP wire contract. These workspace APIs are not released yet.
+The current `LeaderConsensus` uses clustered event-bus messages and shared locks.
+
+== Vert.x-first implementation principle
+
+Vert.x is the runtime foundation of this project.
+Prefer its core reactor, asynchronous filesystem, timers, HTTP, DNS, and lifecycle APIs throughout implementation.
+Public runtime and storage operations should return Vert.x `Future` values and compose through asynchronous completion.
+`ContextDispatch` uses native context-bound promises through `ContextInternal.promise()`, preserving owner-context callbacks
+even when handlers are registered after completion. This internal Vert.x dependency is isolated in that helper and must be
+checked when upgrading Vert.x; no CompletionStage bridge is required.
+Plain immutable records and a deterministic protocol core remain appropriate internal implementation tools.
+
+One event-loop `Context` owns each local consensus instance's mutable protocol and runtime state.
+Marshal external calls and completions back to that context using Vert.x context dispatch.
+Use context ownership instead of `synchronized`, explicit locks, or custom executors for that state.
+Context ownership does not automatically serialize asynchronous operations: use an explicit queue or composed future chain
+so the next storage operation starts only after the previous operation has completed.
+Preserve the existing effect-batch and persistence-barrier rules when dispatching completions into the engine.
+
+[cols="1,3",options="header"]
+|===
+|Responsibility |Preferred implementation
+|Protocol/runtime state |A standard Vert.x event-loop context per instance; no blocking or mutex-based state coordination.
+|Asynchronous API |Vert.x `Future`/`Promise`, composed completion, and explicit lifecycle/error propagation.
+|Files and buffers |Vert.x `FileSystem`, `AsyncFile`, `Buffer`, and future-based read/write/flush operations.
+|Atomic replacement |`FileSystem.move` with `CopyOptions.setAtomicMove(true)` and replacement enabled.
+|Store ownership |Vert.x `AsyncFileLock` on a dedicated file, retained for the store lifetime.
+|Timers, transport, discovery |Vert.x timers, core HTTP client/server, and DNS/SRV APIs.
+|Unavoidable blocking operation |A narrow, ordered `Context.executeBlocking` adapter, with completion returned to the owner context.
+|===
+
+The store-ownership lock protects against another process/JVM using the same directory.
+It is separate from reactor serialization and is not a distributed election lock.
+Use Vert.x's asynchronous file-lock APIs where possible; keep any blocking acquisition variant off the event loop.
+Preserve duplicate-open protection, bounded acquisition behavior, and cleanup of locks acquired after startup cancellation.
+The new Raft protocol requires no Vert.x shared-data distributed lock.
+
+Framework preference must preserve durability: complete a write only after file synchronization, atomic replacement,
+and required directory metadata synchronization succeed.
+Verify the supported filesystem and Vert.x behavior rather than treating an asynchronous write or move as durable by itself.
+Where the required guarantee lacks an adequate Vert.x API, isolate the smallest native operation behind `executeBlocking`;
+do not weaken persistence or run blocking filesystem calls on the event loop.
+
+`AsyncRaftStore` and `VertxRaftStore` provide the asynchronous runtime-facing API.
+The blocking `FileRaftStore` baseline is a package-private test fixture under `src/test/java`; it is not shipped in the library.
+It shares the binary codec, validation rules, and process ownership guard with the asynchronous store, allowing durability,
+corruption and cross-process ownership checks against an independent blocking I/O implementation.
+The unused blocking `RaftStore` interface has been removed; `AsyncRaftStore` is the production storage contract.
+
+== Coordination boundaries
+
+`LeaderCoordinator` assembles concrete implementations, then retains storage as `AsyncRaftStore` and cluster communication as
+`RaftClusterTransport`. `MembershipController` depends on that cluster transport interface and `NodeDiscovery`; it has no
+HTTP implementation dependency. `VertxLeaderNode` needs only `AsyncRaftStore` and the smaller `RaftTransport` protocol boundary.
+`HttpRaftTransport` implements the cluster contract while its outgoing operations consume `RaftConnection` and incoming
+operations use typed server handlers. Internal helpers with one responsibility do not introduce unused parallel interfaces.
+
+`RaftClusterTransport` owns the immutable `BootstrapResult` and `DiscoveryResult` record types. Their inherited source names
+through `HttpRaftTransport` remain usable, but membership policy and new callers can refer directly to the interface types.
+This workspace refactor changes Java implementation/type ownership; it does not change HTTP wire version, durable format,
+bootstrap rules or quorum calculations. Legacy LeaderConsensus and LeaderConsensusOptions remain unchanged.
+
+`RaftPeerRegistry` owns bounded verified endpoints, verification times, identity quarantine and discovery generations.
+A pass aggregates typed contact completions directly instead of retaining per-peer Future chains and joining their results.
+Duplicate callbacks cannot finish a pass early; superseded or closed passes cannot install routes. Contact failures preserve
+known member routes. Only an unambiguous later discovery can clear quarantine, and pruning preserves current members.
+This routing state never grants a vote or changes the effective configuration.
+
+`ContextDispatch.relay` is the single adapter for external completion into a later owner-context turn. DNS, membership and
+participant code reuse it instead of building a contextless promise followed by another bound promise. Deferral is intentional:
+completed futures must not reenter protocol effects before their dispatch finishes. Owned lifecycle, storage, proposal and
+compaction results use native context-bound promises directly, including callbacks registered after completion.
+The asynchronous storage operation queue and explicit effect-batch completion barriers remain in place.
+
+`RaftTlsIdentity` centralizes URI SAN parsing, local credential checks and live connection identity verification.
+Credential/key loading remains in the startup worker operation; the coordinator does not perform it on the event loop.
+These boundaries simplify assembly and communication without adding another scheduler, locking protocol or transport-response cache.
+
+== Foundation milestone
+
+`NodeEndpoint.parse(text)` accepts IPv4 with an optional port and expected identity, defaulting to port 8080.
+`NodeEndpoint.parse(text, defaultPort)` accepts an explicit default; static discovery always uses 8080.
+It rejects hostnames, IPv6, malformed addresses, and invalid explicit ports without attempting name resolution.
+IDs contain 1-128 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit.
+
+`RaftIdentity`, `RaftHardState`, and `AsyncRaftStore` define the production storage contract.
+The test fixture `FileRaftStore.open(directory, groupName[, configuredNodeId])` creates or recovers identity, term, and vote together.
+The optional explicit ID is assigned on first initialization and must match on later opens.
+The directory binds to one group and one identity; ownership is exclusive within the JVM and across processes.
+This test baseline performs blocking I/O; runtime code uses `AsyncRaftStore` and `VertxRaftStore`.
+
+The file implementation uses a versioned, bounded, SHA-256-checksummed state file and a durable initialization marker.
+Updates synchronize a staging file, atomically replace the state file, then synchronize its directory before returning.
+Restart ignores an incomplete staging file and recovers only the authoritative state file.
+A missing or corrupt durable file fails closed; failed writes disable the open store until recovery.
+If initialization is interrupted after its marker is created but before its state file exists, reopening also fails closed.
+Filesystems must support native locks, atomic replacement, and directory synchronization; there is no weaker fallback.
+The implemented tests cover corruption, interrupted staging/initialization, restart, term/vote rules, and native lock ownership.
+These tests do not yet simulate power loss at every synchronization boundary.
+
+The foundation by itself does not modify the existing runtime or provide cluster binding, bootstrap, or network support.
+
+== Election milestone
+
+`RaftElection` implements follower/candidate/leader transitions, initially using an agreed genesis voter set.
+The constructor receives recovered `RaftPersistentState`, timing bounds, cluster identity, and seeded randomness.
+The genesis voter set remains immutable and consistent across nodes and restarts; effective membership is reconstructed
+from replicated configuration entries as described in the joint-membership milestone.
+The latest durable log position is derived from recovered and replicated entries for voting freshness checks.
+
+Each input event returns an immutable batch of effects: state writes, sends, timer scheduling/cancellation,
+protocol role changes, or terminal failure. The engine performs no I/O or wall-clock reads.
+An adapter must finish consuming a batch before delivering another event, including a write completion.
+Use the asynchronous storage adapter for runtime writes and acknowledge them only after durability is confirmed.
+During migration, any call to the existing blocking store must be isolated through Vert.x `executeBlocking`.
+Retain the exact `WriteState` and `ScheduleTimer` effect objects as completion tokens.
+Duplicate or obsolete tokens, including those from an earlier engine instance, cannot trigger transitions.
+
+Pending state is distinct from the last confirmed durable state.
+Dependent vote requests and responses are withheld behind persistence; queued events preserve arrival order.
+An unacknowledged in-memory term may be lost on a crash, but no vote request or grant can have been emitted for it.
+Storage failure, term exhaustion, or an exhausted persistence backlog stops participation and invalidates pending callbacks.
+Higher-term messages demote a leader immediately while the new term is being persisted.
+
+The test simulator separates disk durability from callback delivery, advances virtual time, and controls message loss,
+duplication, reordering, partitions, and crashes. Replayable seeds exercise three- and five-voter groups.
+It checks distinct-voter majorities, persistence-before-send, one elected leader per term, durable term/vote monotonicity,
+and eventual election after faults stop. File-backed restart tests also verify that an acknowledged vote cannot change.
+
+These are protocol elections, not application job leadership notifications.
+An isolated old leader can retain its protocol role until it receives a higher term.
+The Vert.x runtime below adds local readiness checks; later milestones document transport and durable genesis binding.
+The joint-membership milestone below adds dynamic effective configurations.
+
+== Replication milestone
+
+`RaftLogEntry` and `RaftPersistentState` extend durable state with a contiguous log and committed prefix.
+`VertxRaftStore` atomically saves identity, term, vote, log, and commit index in the same checksummed container.
+The blocking test fixture checks the same format and transition rules.
+`appendEntries` and `truncateSuffix` are durable operations; truncation or replacement of a committed entry is rejected.
+The current version-five container reads version-one identity/term/vote files as empty logs, version-two logs
+as unbound state, version-three genesis bindings as initial-voter admission, and version-four admission bindings
+without checkpoints; it upgrades on the next write. Existing unbound protocol history cannot be silently
+assigned to a cluster.
+
+`WriteState.persistentState()` is the complete storage request: adapters must save it through `savePersistentState`,
+not save only the term/vote returned by the diagnostic `state()` accessor.
+Persisting the commit index is an implementation choice that also protects committed prefixes across local restarts.
+`Committed` effects are emitted in index order only after durability confirmation and are replayed on startup.
+This is at-least-once notification; an application adapter must apply idempotently or use an atomic application/snapshot boundary.
+
+Leaders append and persist a no-op in their new term, then replicate through correlated AppendEntries requests.
+Empty requests are consistency-checked heartbeats. There is one outstanding request per follower, retransmitted on timeout.
+Each request carries at most 32 entries. Responses must match its term, request ID, and covered prefix;
+stale responses cannot regress confirmed replication progress.
+Leaders track `nextIndex`/`matchIndex`, repair conflicting uncommitted suffixes, and advance commitment only through
+a current-term entry present on a distinct-voter majority. That commitment also covers preceding entries.
+Followers acknowledge success only after the required log and commitment write completes.
+A shorter request preserves an extra local suffix and commits only the prefix proven by that request.
+
+`propose(data)` appends opaque coordination metadata on a protocol leader with no pending write.
+It is not an application job execution API or a client commitment acknowledgement.
+The caller observes later `Committed` effects for actual commitment.
+
+This first storage implementation rewrites the complete bounded snapshot on each update.
+Limits are 4096 retained entries, 16 KiB of UTF-8 data per entry, and 8 MiB of aggregate retained entry data.
+Invalid or over-capacity proposals are rejected; a new leader that cannot append its required no-op stops participation.
+The snapshot milestone below compacts committed prefixes while keeping these retained-tail bounds.
+
+Tests cover durable append/truncate, format upgrade, conflicting suffix repair, duplicate/out-of-order responses,
+current-term commitment rules, ordered replay, and committed data surviving leader failure.
+The simulator checks committed-entry agreement, leader completeness, and log matching after events.
+Injected exceptions after staging-file synchronization, atomic replacement, and directory synchronization verify complete-state
+recovery and failed-store isolation for both append and truncate. They model I/O boundary failures, not physical power loss.
+
+== Vert.x storage and runtime milestone
+
+`VertxRaftStore.create(vertx, directory, groupName, nodeId)` captures an event-loop context without opening files.
+`open`, reads, writes, and `close` return Vert.x futures, including owner-context delivery for callbacks registered
+from another thread after completion. A bounded context-owned queue serializes accepted operations.
+`close` rejects new operations, drains accepted writes, and releases native ownership; it cancels pending native
+lock acquisition by closing its channel. The default acquisition timeout is five seconds.
+Asynchronous file read/write/flush and atomic move use Vert.x APIs; encoding, transition validation, canonical paths,
+and native directory synchronization use ordered Vert.x workers. No blocking file operation runs on the event loop.
+A failed durability operation disables further use until a new instance recovers the directory.
+
+`VertxLeaderNode` owns a `RaftElection` on the store's context. It dispatches complete effect batches before
+reentering the engine with storage completions, timer events, or received messages.
+It accepts an injected `RaftTransport`; transport completion is submission, not peer durability.
+The transport must authenticate and authorize peer identities for this cluster before passing messages to `receive`.
+The HTTP/discovery and bootstrap milestones below supply network and durable initial-configuration integration.
+The explicit fixed-voter constructor durably pins its supplied cluster ID and voters on first empty-store startup,
+then rejects conflicting restart configuration. `fromStore` derives the configuration from installed genesis.
+
+`start` completes after recovery and participation begins; it does not wait for leadership.
+`leadershipHandler(Handler<Leadership>)`, `committedHandler(Handler<RaftLogEntry>)`, and
+`exceptionHandler(Handler<Throwable>)` run on the owning context. Handler registration is asynchronous and
+leadership registration delivers the current observation. Register committed delivery before starting to observe recovery replay.
+Subscriber exceptions are reported without stopping the protocol; storage failure stops participation and closes storage.
+Transport failures are reported, while the engine's timer-driven retries continue.
+
+`Leadership.leader()` becomes true only after a current-term entry is durably committed and the effective voting
+configuration has recently acknowledged correlated AppendEntries; joint configurations require both majorities. Evidence expires after the minimum election timeout and is
+anchored to request dispatch time; duplicate or delayed responses cannot renew it indefinitely.
+A periodic heartbeat-frequency check demotes local readiness on quorum loss, even if the protocol role remains leader.
+Event-loop stalls can delay notification, and this observation is neither a strict lease nor external fencing.
+A higher observed valid peer term suppresses readiness while a pending durable write delays core event processing.
+
+`propose(data)` allows one outstanding local proposal on a ready leader without a pending storage write.
+Its future completes only after local durable commitment. On readiness loss or shutdown it fails with an unknown
+outcome: an accepted entry may still commit after recovery, so callers must not assume failure means absence.
+Committed entry delivery remains at least once across restarts. `close` cancels timers, suppresses late activation,
+fails outstanding proposals, and waits for the store's accepted I/O and ownership release.
+
+Tests exercise real Vert.x timers and filesystem operations, three-voter replication and partitions, durable readiness
+and proposal barriers, handler context affinity, recovery replay, subscriber/storage failures, shutdown during I/O,
+and cancellation/timeout while another JVM holds the native file lock.
+
+== HTTP and discovery milestone
+
+`HttpRaftTransport` implements `RaftTransport` using Vert.x core HTTP client/server APIs without additional frameworks.
+It owns its client and listener, uses the store's event-loop context, and accepts recovered `RaftIdentity`, the agreed
+cluster ID, and ordinary Vert.x `HttpServerOptions`/`HttpClientOptions`.
+The listener defaults to port 8080; callers may configure a different port, including zero for an ephemeral test listener.
+Endpoints remain IPv4-only. Bind wildcards are listener options, never advertised/discovered endpoints.
+
+Transport options select plaintext or mutual TLS; the server and client must use the same mode.
+Plaintext accepts syntactically valid self-reported node IDs in `X-Inqwise-Node-Id` and binds protocol payloads to those claims,
+but does not authenticate them. The authentication and admission guarantees described below apply to TLS deployments.
+`LeaderCoordinator.create(vertx)` supplies a local plaintext one-voter preset; `create(vertx, options)` uses plaintext
+with explicit immutable options, whose default target remains three.
+When TLS is enabled, configure local key/certificate and CA trust options on both sides, server client-authentication
+as `REQUIRED`, and verified client hostnames/IP SANs. Trust-all clients and disabled hostname verification are rejected.
+By default, a leaf certificate contains exactly one URI SAN `urn:inqwise:leader:node:<persistedNodeId>`;
+its IP SAN must also authorize the concrete IPv4 endpoint. A supplied certificate identity function may implement
+another explicit issuance/identity policy. The CA/identity policy must authorize each persisted node ID uniquely.
+Both local and remote certificate identities are checked against protocol IDs; HTTP self-reporting alone is insufficient.
+The committed test certificates/private keys under `src/test/resources/tls` are loopback fixtures only.
+
+Call `listen(node::receive)` to obtain the bound port, then resolve/handshake peers before `node.start()`.
+`discover(List<NodeEndpoint>)` contacts each `/identity` endpoint, verifies TLS, wire version, persisted node ID,
+group and configured cluster ID, then installs routes keyed by verified node ID.
+An expected `#nodeId` suffix constrains the handshake; it never renames the peer.
+Each pass returns verified peers and per-endpoint failures. A failed contact or empty discovery pass preserves old routes.
+A newer concurrent pass supersedes an older pass. Multiple concrete endpoints claiming one node identity are
+conservatively quarantined: outbound routes are removed and inbound protocol dispatch is rejected for that identity.
+A later unambiguous verified pass can restore the route. This conservative policy also rejects simultaneous multi-address
+claims; do not advertise multiple active endpoints for one identity at this stage.
+The local identity is excluded from remote route results. Discovery never adds/removes voters or changes quorum.
+
+`NodeDiscovery.staticEndpoints(...)` returns immutable parsed endpoints. `SrvNodeDiscovery(context, dnsClient, name)`
+uses Vert.x `DnsClient.resolveSRV`, then resolves every target's A records and preserves the SRV-specified port.
+It enumerates targets rather than load-balancing Raft requests. Results contain endpoints, target-specific failures,
+and a refresh hint from the minimum SRV TTL, bounded to 1 second through 24 hours.
+A root target (`.`), a target without IPv4, or invalid port is unavailable; a failed SRV lookup fails the resolution pass.
+A-record TTLs are not exposed by `DnsClient`; the SRV hint is not an A-record cache contract.
+The caller owns/closes the DNS client and schedules repeated resolution. This milestone performs explicit passes;
+the controller milestone below supplies automatic refresh and lifecycle ownership.
+Compose `source.resolve()` with `transport.discover(result.endpoints())`, observing both DNS and handshake failures.
+Keep installed routes and voting membership through DNS failures; no DNS result authorizes bootstrap or replacement.
+
+The implemented group path is `/leader/v1/groups/<encoded-group>` with the group encoded as one path segment.
+`GET /identity` returns a versioned binary identity response; `POST /request-vote`, `/vote-response`, `/append-entries`,
+`/append-response`, `/install-snapshot`, and `/snapshot-response` carry versioned addressed envelopes with content type `application/vnd.inqwise.raft`.
+The codec has explicit magic/version fields, bounded strict UTF-8 strings, exact integer fields, bounded batch counts,
+and rejects truncation, invalid values, and trailing bytes. Wire and durable-store formats are independent.
+A protocol POST returns HTTP 202 after receiver dispatch, not after persistence.
+The Raft core emits its correlated response as a separate POST only after the required durability barrier;
+HTTP status alone never contributes a vote or a replication acknowledgement.
+This asynchronous response arrangement preserves the core's existing effect/persistence sequencing.
+
+Limits are 600 KiB per request/response body, 32 append entries, 64 simultaneous outgoing preparations/requests,
+64 incoming requests and 64 discovery endpoints. Body limits apply incrementally, including chunked requests.
+Connections and whole request/response exchanges have five-second timeouts; redirects and response decompression
+are disabled. The engine supplies retries; transport acceptance futures report timeout or HTTP rejection.
+`close` cancels outgoing requests, prevents late route installation/listener activation, and closes owned resources.
+Close the node first, then the transport; close externally owned DNS clients separately.
+
+Tests use independent Vert.x instances, real loopback mutual TLS connections, durable stores, and a local UDP DNS
+server. They cover identity/group/cluster constraints, authenticated sender/receiver binding, malformed and oversized
+payloads, duplicate identity quarantine, bind/request cancellation, queue bounds, SRV/A failures and explicit ports,
+three-node election/commitment, and successor election after leader loss.
+Later milestones below add durable genesis, joint membership, automatic membership management and snapshots.
+Production destination fencing/persistence integration and deployment-specific acceptance remain before a replacement for `LeaderConsensus`.
+The separate-JVM tests below cover process failure and retained-state recovery.
+
+=== Callback-driven outgoing connections
+
+`RaftConnection` is the internal typed peer boundary used by outgoing transport calls. `HttpRaftConnection` implements
+identity, membership, bootstrap/install, join/leave and Raft message operations using Vert.x `Completable` callbacks.
+`HttpRaftTransport` consumes that interface; it does not call concrete peer operation methods.
+`HttpRaftClient` assembles logical peer connections over one shared Vert.x HTTP client pool and bounds active exchanges.
+Logical connections retain only the endpoint and shared client reference; they do not pin physical sockets or retain responses.
+
+Each short-lived exchange owns its completion callback, timer, HTTP cancellation handle and bounded response buffer.
+Success, failure, timeout and close detach stream handlers and clear buffers/callback references before notifying the caller.
+The exchange leaves the registry immediately unless an accepted codec task still needs to finish. Late connection acquisition resets the acquired HTTP request; late responses cannot complete a caller twice.
+The admission slot covers encoding, HTTP pool acquisition, response reading and decoding under a single deadline.
+Timed-out codec tasks retain their capacity slot until they finish; close drains accepted worker completions before resolving.
+Responses are decoded once into typed values, including certificate/body identity agreement checks.
+Small outbound messages and metadata replies use direct owner-context codec calls. Snapshot and larger append encoding,
+and responses larger than 16 KiB, use workers; codec work is in memory and performs no blocking I/O.
+
+Future allocation at this boundary is limited to adapting outgoing operations back to the existing transport Future API;
+connection internals pass completions through handlers rather than adding promise chains at each step. Native HTTP and worker
+operations still use Vert.x futures. Incoming HTTP dispatch is separated through the typed server handlers described below; the wire contract and durable Raft
+acknowledgements are unchanged.
+
+Connection tests cover certificate/body identity disagreement, owner-context completion, timeout with late response, bounded
+response rejection, cancellation on close, reuse of capacity after terminal outcomes and draining timed-out codec work. Existing HTTP, membership, bootstrap,
+snapshot and process tests continue to exercise the transport through this connection boundary.
+
+=== Typed incoming HTTP handlers
+
+`HttpRaftServer` implements the standard Vert.x `Handler<HttpServerRequest>` used by its HTTP listener. It owns route matching,
+HTTP validation, bounded request-body reads, deadlines, temporary buffers and listener shutdown. Generic route handlers receive
+only an authenticated peer ID, a decoded message and a `RaftRequestCompletion` callback; no HTTP request or response escapes
+into protocol, bootstrap or membership policy handling. `HttpRaftTransport` registers typed handlers that delegate to the
+existing bootstrap, participant and controller policies. Incoming and outgoing HTTP share the `RaftPeerVerifier` identity boundary.
+
+The server marshals callbacks from Vert.x's HTTP request context onto the configured owner context. Body delivery pauses while
+a chunk crosses that boundary, then resumes after the owner has checked the size limit and consumed it. Small codecs run
+directly; bodies above 16 KiB decode on workers. Incoming request processing allocates no promise/future chain of its own;
+registered services pass their existing asynchronous completion to the callback. Listener lifecycle and workers use native
+Vert.x futures.
+
+Each incoming exchange completes at most once. Every route, including metadata GETs and partial request bodies, has a deadline.
+Timeout, disconnect and close clear HTTP references and temporary buffers; duplicate or late completions cannot write another
+response. `RaftRequestCompletion.isActive()` lets a policy check caller activity before starting work after an asynchronous
+lookup. It does not roll back an accepted durable write: a request timeout can still have an uncertain committed outcome.
+Expired requests retain their admission slot until accepted policy or codec work finishes. Close stops admission, cancels HTTP
+exchanges and drains accepted codec workers; policy/storage work follows its owning component's existing shutdown lifecycle.
+
+Server tests exercise typed owner-context delivery, one decode per request, duplicate completion, expiry with late policy
+completion, saturation while expired work remains pending, partial-body deadlines and close during decoding. Existing mutual
+TLS, spoofed sender/path/cluster, oversized body, durable bootstrap and membership scenarios exercise the registered real policies.
+
+== Durable binding and bootstrap milestone
+
+`RaftGenesis` contains cluster ID, group, designated authority ID, the initial voter set, initial target count,
+and a canonical SHA-256 digest. Voter ordering does not change the digest. Authority-created records use a generated
+cluster UUID; the explicit manual API retains its caller-supplied cluster ID and records a null authority.
+`RaftBootstrapState` distinguishes the authority's durable record from completed installation on a selected voter.
+The record is immutable; its voters are the genesis configuration, not an API for runtime membership changes.
+
+The checksummed store container atomically preserves genesis and installation/admission state with identity,
+term, vote, log, and commit index. Both stores expose `bootstrapState`, `createGenesis`, and `installGenesis`.
+Formation and installation complete only after the existing staging-file synchronization, atomic replacement,
+and directory synchronization barriers. I/O failure disables the open store until recovery.
+Concurrent formation requests return the first record; later candidate sets or local target changes cannot replace it.
+A conflicting genesis, wrong group, non-selected bootstrap recipient, or assignment of existing unbound protocol history is rejected.
+Identical installation is harmless even after the node has advanced its term/log. An authority-only uninstalled record
+cannot accumulate protocol state or start elections. Versions one and two remain readable for inspection/recovery;
+nonempty unbound history requires a separately designed explicit migration, not automatic assignment.
+
+`RaftBootstrap(store, authorityId)` defaults to three initial voters; an overload accepts an odd target from 1 through 63,
+including single-node development and targets seven/nine. The configured authority identity is explicit and stable.
+`form(verifiedPeers)` includes the local authority as an eligible candidate, waits for the full target, and selects the
+lexicographically first unique IDs once. The authority need not be selected when more eligible candidates sort before it.
+Eligible remote peers must have authenticated identity-handshake results for this group and be unassigned;
+an already assigned candidate prevents formation of a second cluster. Existing records are always recovered first.
+The store serializes formation atomically; discovery order and concurrent requests cannot create competing local records.
+
+`HttpRaftTransport.forBootstrap(controller, serverOptions, clientOptions)` opens/recovers local storage and creates
+a listener capable of advertising unassigned identity and serving bootstrap operations using the existing mutual TLS policy.
+The configured authority must match any recovered genesis. `GET /bootstrap` on the authority returns its original record,
+or HTTP 425 while formation is pending. `POST /bootstrap/install` accepts only the configured TLS-authenticated authority,
+validates the exact record and selected recipient, and returns HTTP 202 only after local durable installation.
+Conflicting or incompatible installations return HTTP 409. An HTTP failure/timeout can leave an already durable installation;
+retry the same record rather than assuming absence or selecting replacement voters.
+
+On the authority, `transport.bootstrap(endpoints)` performs a verified discovery pass, forms/persists once, and installs
+that exact record on selected voters, including itself when selected. It returns the immutable genesis and per-voter
+installation failures. Retrying after partial installation uses the original UUID, voters, and policy; previously verified
+routes may be reused when a selected voter is temporarily missing from discovery. It never shrinks the initial set.
+Selected nodes can also call `fetchBootstrap(authorityEndpoint)` to fetch from the explicitly authenticated authority
+and durably install the original record. No non-authority can form a record or send an authorized installation.
+Fewer eligible nodes than the target leave formation pending without a record or any election participation.
+
+`VertxLeaderNode.fromStore(store, transport)` reads installed genesis and uses default election timing/jitter;
+an overload accepts explicit timing and randomness for tests. Register handlers and prepare routes before `start`.
+Startup validates the local identity and binding against transport policy before timers or elections begin.
+The old explicit fixed-voter constructor persists its manual initial binding only on empty state and rejects changes on restart.
+It cannot bypass the authority policy of a bootstrap-enabled transport. Dynamic membership will later derive effective
+configurations from replicated configuration entries, rather than reinterpret this immutable initial voter set.
+
+These APIs expose explicit formation/discovery passes. Later milestones below add learner transitions and a background
+controller, snapshots, and the configured lifecycle facade.
+Established installed voters restart and elect from their own stores without contacting the authority.
+Never deploy another empty authority directory for an established group; backup/recovery and authority ownership remain
+operator responsibilities, and separate empty authorities are not reconciled automatically.
+
+Tests cover atomic formation/installation failures at each write boundary, canonical digest corruption, version-two
+unbound recovery, concurrent formation, target counts 1/3/7/9, rejected authority/cluster/voter changes, durable HTTP
+acknowledgements, interrupted installation/retry, authority restart, and full surviving-majority restart while the authority
+stays offline. These tests model I/O boundary failures and process restarts, not physical power loss.
+
+== Joint membership and learner milestone
+
+`RaftConfiguration` represents stable membership with equal old/new voter sets, or joint membership with different
+sets. Each quorum decision requires a distinct-node majority of each voter set; learners never contribute votes,
+commit acknowledgements, or application readiness. The implementation bounds voters plus learners to 63 identities.
+Genesis remains the immutable cluster anchor. `CONFIGURATION` log entries contain canonical old/new/learner sets,
+and legal transition validation rejects direct stable-to-different-stable voting changes.
+The latest log configuration governs elections and commitment immediately, including before commitment;
+truncating an uncommitted configuration suffix restores the previous configuration.
+`membership()` reports both effective membership and the last confirmed durable committed configuration.
+
+`addLearner(id)` commits a replication-only participant before promotion. Its future confirms admission in the
+replicated configuration, not completed catch-up. `replication()` exposes correlated durable `matchIndex` progress.
+`changeVoters(ids)` requires an active leader with a current-term committed entry, no outstanding store write,
+and a committed stable preceding configuration. Added voters must already be learners with a current-leader
+acknowledgement covering the current durable committed index.
+The leader appends joint membership and commits it with both majorities, then automatically appends the final stable
+configuration. The final configuration commits with the new quorum. Other configuration changes are rejected until
+that transition settles. `removeLearner(id)` removes a replication-only participant without changing voting quorums.
+These explicit operations do not change the desired-count policy. The controller milestone below chooses replacement
+candidates toward the original persisted target.
+
+A successor reconstructs its effective configuration from the recovered log. A joint transition resumes after a
+current-term entry commits; a logged final configuration already governs new-set elections, even if its commitment
+was unknown before the crash. A removed leader continues protocol replication to commit the final configuration,
+without counting itself toward the new quorum, then steps down. Local application readiness becomes false as soon
+as effective membership excludes the local leader. Removed followers may learn removal through best-effort replication;
+the API currently confirms final commitment on the initiating leader, not acknowledgement by every departing process.
+
+The core emits a separate minimum-leader-contact timer. During that window it ignores RequestVote term/vote changes,
+preventing stale/removed processes from repeatedly disrupting a healthy leader. Current voters alone can grant votes;
+learners and removed nodes do not campaign. An outdated admitted peer can still receive AppendEntries from a new
+leader outside its older configuration, allowing full-log catch-up after promotion/replacement.
+As with ordinary Raft, peers are assumed non-Byzantine. Authentication must authorize identities for the consensus
+group/cluster: use appropriately scoped CA trust or a certificate identity policy, rather than trusting certificates
+issued to arbitrary external groups. A self-reported cluster ID is not an admission credential.
+
+`installLearnerGenesis(genesis)` is a trusted local storage operation for an identity outside genesis voters.
+The caller must authorize admission and supply the established cluster's original record. It durably records admission
+without granting a vote; bootstrap's network `/bootstrap/install` endpoint still rejects non-selected initial voters.
+`VertxLeaderNode.fromStore` can start the admitted process as a learner, using the original genesis and the latest log.
+Version four adds an admission marker to storage; that marker remains after promotion and is not the current role.
+Effective voting/learner status comes from configuration entries. Version-three voter bindings remain readable.
+The departure-aware binary transport now uses frame version four, retaining the versioned HTTP namespace;
+older frame versions are rejected. These unreleased implementations require coordinated protocol upgrades.
+
+Runtime methods return owner-context futures. A voting change completes only when its final stable configuration
+is durably committed. The initiating leader may therefore receive successful completion while relinquishing leadership.
+Quorum-readiness loss during a joint transition does not discard the transition; term/leadership loss or shutdown fails
+its future with an unknown outcome. Recover and inspect committed membership before deciding whether to retry.
+Data and membership proposals are serialized at the public runtime API; the core retains full effect/persistence barriers.
+No new mutex, custom executor, or blocking event-loop I/O is introduced.
+
+Tests cover old-only/new-only quorum rejection, dual-majority elections, learner exclusion and catch-up barriers,
+uncommitted suffix rollback, crash after joint durability but before callback delivery, randomized reordering/partitions,
+staged/replaced/durable storage failures for joint and final entries, older store migration, and committed diagnostics.
+A real TLS HTTP scenario expands one voter to three, removes its current leader under a controlled partition,
+and restarts promoted and removed identities while preserving original genesis and effective membership.
+The controller milestone below adds authenticated network join, automatic voter replacement and controller lifecycle.
+The snapshot milestone below adds prefix compaction and lagging-member catch-up.
+The following milestones add committed graceful removal and the configured lifecycle facade.
+
+== Automatic membership controller milestone
+
+`MembershipController(store, http, discovery)` owns the local participant, store and bootstrap-enabled HTTP transport.
+It uses the store's event-loop context, Vert.x futures and one-shot timers; one control pass completes before another
+is scheduled. `start` confirms local recovery/listener startup, not completed formation or leader readiness.
+Register `leadershipHandler` and `exceptionHandler` before starting. `participant()` becomes available after durable
+assignment and local runtime startup. `close` immediately demotes application readiness, cancels control scheduling,
+stops Raft and closes owned HTTP/storage resources, including accepted durable I/O. Discovery/DNS resources remain caller-owned.
+A lifecycle generation suppresses late creation, admission and scheduling callbacks after shutdown.
+Each pass refreshes discovery, checks cluster binding, then handles initial formation or installed membership.
+Reconciliation reads fresh membership and reuses the pass's immutable genesis record for its durable voter target.
+
+Default controller options refresh routes/health every second, observe failure for 30 seconds and keep at most two
+standby learners. The voter target comes exclusively from durable genesis, whose default formation target is three;
+local controller options cannot override it. An optional advertised endpoint supports wildcard listener binds;
+otherwise joining nodes use their concrete listener IPv4 host and actual port. The callback endpoint must be reachable
+from other members and, with TLS, its IP/node identity must match. The configured coordinator facade below assembles these components.
+
+The controller recovers local bootstrap state first. The designated authority retries formation/initial installation
+with the original durable record until the initial group operates; it never regenerates an existing cluster UUID.
+Installed voters start from their own stores. Initial selected nodes awaiting their first installation can fetch the
+original record from the configured authenticated authority. Fresh identities outside genesis wait for a current ready
+leader, then request learner admission. Established groups and new learner admission do not depend on a running
+bootstrap authority. Replacing an authority's directory with empty storage remains prohibited operationally.
+
+Discovery resolves endpoint generations using the SRV refresh hint while health/identity probes continue at the control
+interval. Failed DNS queries retain the last resolved endpoint set; verified member routes survive endpoint disappearance.
+Only known membership routes are retained independently of the current discovery generation. Aged observer routes
+are pruned, and route tables are capped at 64 identities. Duplicate identity claims are quarantined; incompatible cluster claims suspend automatic admission.
+Different cluster IDs are never merged. An unambiguous later discovery generation can resume it.
+Discovery changes alone never alter voting membership or quorum.
+
+`GET /membership` returns an authenticated coherent `MemberStatus` containing original genesis, current term,
+known leader, readiness and effective configuration. Its identity must match the TLS peer and response identity header.
+`POST /join` carries the joining persisted identity, existing cluster binding (or null), callback IPv4/port, and a freshly
+observed leader term. Only the current ready leader's registered controller can authorize it. The controller verifies
+that callback endpoint against the joining TLS identity, rechecks term/configuration and learner limits, and commits
+`addLearner` before returning the original genesis and committed admission observation. Followers, stale requests,
+spoofed identities, incompatible clusters and exhausted learner pools are rejected. Admission retries are idempotent.
+The joining node checks the authenticated response/term/genesis, installs local admission durably and starts as a learner.
+The existing frame version and bounded strict codecs cover these new endpoint-specific messages.
+
+A returning removed identity with retained compatible state must request admission again. Its log, term and original
+genesis are preserved; it does not regain a vote through discovery. A correlated response from an admitted learner with
+a higher retained term can make the leader observe/persist that term before retrying, allowing recovery without term
+rollback. Uncorrelated learner responses cannot force that transition, and learner acknowledgements never count as votes.
+Corrupt or missing marked state fails closed and is not reconstructed by admission. Replacing an entire data directory
+while reusing its voter identity cannot be distinguished from first installation and remains prohibited operationally;
+use an explicit recovery procedure for lost voter state.
+
+Only a ready leader with a stable, committed configuration and no outstanding local operation makes policy decisions.
+`MembershipView` atomically reports readiness, membership, durable committed index, current-leader `matchIndex`, recent
+correlated replication responders and operation state. Learner responses are tracked for health/catch-up while quorum
+calculation continues to use only effective voters (both sets during joint consensus). Member health comes from Raft
+acknowledgements, rather than DNS disappearance or an identity endpoint alone. Failure timers restart after leadership
+term/voter-set changes and reset when a member responds again.
+
+Healthy voters stay selected when more nodes arrive. Caught-up responsive learners fill a deficit toward the persisted
+target. At the target count, the controller replaces one continuously unreachable voter with a caught-up learner after
+the delay, preserving voter count. It can remove excess voters toward the persisted target and evict expired learners
+without reducing voting quorum. The Raft runtime performs every actual change through joint consensus. Decisions are
+bound to the observed term and configuration index so delayed work cannot apply an old policy decision in a new epoch.
+A minority cannot replace voters, even when a learner is available. Incomplete joint transitions resume in the core;
+the controller waits for them to settle rather than starting a competing transition.
+
+This remains non-Byzantine Raft: CA/identity policy must authorize peer identities for this group/cluster. A TLS identity
+or self-reported leader status is not a cryptographic quorum certificate. The implemented admission endpoint itself
+checks real local Raft readiness and committed learner admission; no unauthenticated or arbitrary voter-set installation
+endpoint is exposed. A failed/timed-out admission may already have committed, so retries preserve genesis and inspect
+current configuration. Stop a controller when deliberately leaving; an active returning controller can seek standby
+learner admission again; the graceful-leave milestone below adds committed removal acknowledgments.
+
+[source,java]
+----
+// serverOptions and clientOptions are ordinary Vert.x mutual-TLS options.
+var store = VertxRaftStore.create(vertx, java.nio.file.Path.of("./leader-node-a"), "scheduled-job", "node-a");
+var bootstrap = new RaftBootstrap(store, "node-a"); // Default initial target: 3.
+var discovery = NodeDiscovery.staticEndpoints(java.util.List.of(
+    NodeEndpoint.parse("192.0.2.10#node-a"),
+    NodeEndpoint.parse("192.0.2.11#node-b"),
+    NodeEndpoint.parse("192.0.2.12#node-c")));
+HttpRaftTransport.forBootstrap(bootstrap, serverOptions, clientOptions).compose(http -> {
+    var controller = new MembershipController(store, http, discovery);
+    controller.leadershipHandler(leadership -> { /* start/stop application work */ });
+    controller.exceptionHandler(cause -> { /* observe retryable failures */ });
+    return controller.start().map(controller);
+});
+// Retain the controller and compose controller.close() during verticle shutdown.
+----
+
+Tests use real independent Vert.x instances, durable stores and mutual TLS to exercise automatic three-voter formation,
+standby admission, failed-leader election/replacement, retained-identity re-admission, no healthy-voter reshuffling,
+learner-pool bounds, DNS outage, minority safety, stale/nonleader/spoofed joins, conflicting clusters and recovery after
+conflict removal, callback context affinity and cancellation during discovery. Pure policy tests cover targets 3/7/9,
+catch-up/expiry barriers and unchanged target size.
+
+== Snapshot and compaction milestone
+
+`RaftSnapshot` contains the last included absolute index and term, the committed configuration and its entry index,
+and opaque application state (strict UTF-8, at most 512 KiB). A checkpoint may contain joint membership; it preserves
+both voter majorities until a later final configuration commits. Immutable genesis and learner-admission metadata remain separate.
+`RaftPersistentState` atomically stores this checkpoint, the retained contiguous suffix and the absolute commit index.
+`baseIndex`, `lastIndex`, `entryAt` and `termAt` expose absolute positions; log-list offsets start immediately after the checkpoint.
+Total history can exceed 4096 entries through compaction; the 4096-entry/8-MiB retained-tail bounds still apply.
+
+Version-five storage writes the complete checkpoint and suffix through the existing staged-write, file-sync,
+atomic-replace and directory-sync sequence. Prefix removal and checkpoint installation are one durable replacement.
+A failed replacement therefore recovers a complete old or complete new state. Compaction cannot move commitment backwards,
+change a known committed boundary term or configuration, or overwrite later committed entries. Existing checkpoint boundaries
+cannot be rewritten. Checksums and strict decoding reject corruption; versions one through four remain readable.
+
+`VertxLeaderNode` automatically attempts compaction after 128 committed retained entries, without new mandatory configuration.
+Coordination-only prefixes need no application hooks. If an earlier checkpoint contains application state and the new prefix
+contains only coordination entries, that state is carried forward unchanged.
+A prefix containing `DATA` is retained until application hooks are registered; no application state is silently discarded.
+Applications may explicitly call `compact()` to checkpoint a shorter committed prefix.
+
+Register `snapshotHandlers(provider, restorer)` before node startup. The provider receives a `SnapshotPoint` containing
+an exact committed boundary and must return application state for that index, not the latest state at eventual completion.
+Committed handlers queued by the preceding protocol batch run before automatic preparation. Providers must retain/version state
+when preparation is asynchronous; the protocol continues and retains later entries while the provider works.
+Both hooks run on the owning Vert.x event-loop context and return futures; use asynchronous APIs for I/O.
+The final replacement waits for the current protocol write to finish. Provider failure preserves the log and is retryable.
+The low-level core's `compact(RaftSnapshot)` trusts its adapter to supply correct application state.
+
+On recovery the runtime restores the checkpoint before creating/starting the engine, replaying retained committed entries,
+or becoming leader-ready. Incoming checkpoint installation waits for both durable storage and asynchronous application restoration
+before acknowledging success. The restorer must be idempotent: a crash after storage but before acknowledgment retries restoration
+on recovery. An application that stores state separately must provide its own atomic boundary/deduplication strategy.
+Nonempty checkpoint data without a restorer fails startup/installation; restoration failure stops participation.
+Shutdown demotes immediately, cancels timers and waits for accepted restoration before releasing store ownership.
+A pending producer is discarded on shutdown and cannot later compact a replacement node's store.
+
+For the automatic controller, register `MembershipController.snapshotHandlers(provider, restorer, committedHandler)` before
+`start`; it forwards all three hooks before starting its owned participant. Coordination-only deployments need no hooks.
+
+When a member's `nextIndex` falls inside a compacted prefix, its leader sends `InstallSnapshot` instead of an unavailable
+AppendEntries batch. The bounded full checkpoint uses `POST /install-snapshot`; a separate `POST /snapshot-response` carries
+the term, request ID, accepted flag and included index. The same TLS, cluster, group, sender, size and route guards apply.
+There is at most one append or checkpoint transfer outstanding per member. Only a matching acknowledged checkpoint advances
+`matchIndex`; later entries then flow through AppendEntries. Retrying an already committed checkpoint is idempotent and
+never restores old application state over newer committed state. A matching local index/term preserves the suffix;
+otherwise installation discards conflicting uncommitted history. Known committed conflicts stop participation.
+The current frame version requires a coordinated upgrade of these unreleased participants; older frames are rejected.
+
+This implementation transfers one complete checkpoint, bounded to 512 KiB of application data within the 600-KiB wire limit.
+Streaming/chunked snapshots and a segmented log backend are future extensions. Tests cover interrupted replacement, old-format
+migration, corruption, absolute indexes beyond 4096, joint configuration recovery, stale/duplicate acknowledgments, restoration
+barriers and shutdown, asynchronous production with concurrent proposals, automatic metadata compaction, randomized loss/restarts,
+and real mutually authenticated HTTP learner catch-up followed by promotion and cluster restart.
+
+== Graceful leave milestone
+
+`MembershipController.leave()` suspends application leadership, commits removal through the current leader, and closes
+owned resources. Its default membership deadline is 30 seconds; `leave(timeoutMillis)` accepts an explicit positive deadline.
+Repeated calls share the first operation and deadline. `close()` remains immediate local shutdown without a removal promise;
+calling it during leave cancels the leave future with an unknown removal outcome.
+
+`VertxLeaderNode.drain()` permanently suspends application readiness and rejects ordinary application proposals and public
+membership changes for that instance. The Raft engine keeps processing votes, replication and authenticated removal work
+until cleanup. A departing leader therefore continues helping its current quorum commit its removal, with no new application
+leadership notifications. Already accepted application entries may still commit; their failed futures can have unknown outcomes.
+There is no accelerated leadership-transfer RPC: surviving voters elect the next leader through normal Raft timing.
+
+The leader removes a learner through a committed configuration entry. Voter departure uses joint consensus and finalization,
+preferably replacing the departing voter with one responsive learner caught up through the observed committed index.
+Without a replacement it can commit a smaller nonempty set; immutable genesis retains the desired target, and normal admission
+and promotion restore it when candidates become available. The final voter cannot remove itself without a caught-up replacement.
+All operations retain current-term readiness, separate joint majorities and configuration-index checks; departure never overrides quorum.
+
+The authenticated `POST /leave` request contains the caller's persisted identity, existing cluster binding and observed leader term.
+The TLS identity must match the departing identity; callers cannot remove another member. Followers, stale terms, foreign clusters,
+wrong groups, unsettled configurations and busy leaders reject requests. The controller retries within its deadline, using retained
+verified routes even when DNS is unavailable and selecting the first verified ready leader without waiting for stalled peers.
+An already absent identity receives an idempotent committed removal receipt.
+The response includes responder identity, cluster, term, removed identity, committed stable configuration, configuration index
+and durable commit index. It cannot be produced from an uncommitted effective configuration.
+
+`GET /identity` now includes an authenticated per-instance departure flag. A leaving transport rejects new local join requests,
+and admission callbacks reject departing peers. Leader-side departure observations exclude pending departures from promotion;
+admission probes capture a departure generation so a probe started before leave cannot clear newer departure intent.
+A restarted instance reports no departure intent and can be admitted again with its retained identity and original genesis.
+The flag and pending-removal observations are volatile lifecycle state, not a permanent membership ban.
+Frame version four carries this identity extension and requires coordinated upgrade; durable storage remains version five.
+
+A leave timeout or transport/term failure can leave removal already committed or in progress. The controller closes locally
+and fails its future rather than claiming removal. Its deadline bounds the membership wait, not accepted durable I/O or application
+restoration during cleanup. No genesis at all permits local cleanup without a membership change; a prepared genesis or installed
+binding without a ready participant cannot be reported as confirmed removal. Before checking an unassigned startup,
+leave waits for accepted controller/bootstrap work so a late genesis write cannot turn a successful cleanup into an unreported assignment. Stored identity, genesis, term and log are preserved.
+Applications should handle the returned future during verticle shutdown and record unconfirmed removal for later inspection.
+For example, compose `controller.leave()` from the verticle's asynchronous stop lifecycle; use `close()` for abrupt local shutdown.
+
+Tests use real mutual TLS, independent Vert.x instances and durable stores for learner, follower and leader departure,
+replacement preference, smaller surviving configurations, successor election, final-voter protection, stale DNS, retained-identity
+re-admission, no-quorum timeout, cancellation and pre-formation cleanup. A gated commit write proves that removal remains pending
+until durability. Authenticated retry tests check idempotent receipts, and strict codecs reject malformed or truncated evidence.
+
+== Configured coordinator milestone
+
+`LeaderOptions` is immutable and has no public constructors or setters. Public creation uses `LeaderOptions.builder()`
+or `LeaderOptions.builder(json)`, followed by `build()`. `toBuilder()` derives an independent mutable builder from existing
+options; each build returns a fresh immutable snapshot. Required fields are `groupName` and `bootstrapAuthorityId`.
+Unknown coordinator/discovery/timing/membership/DNS keys, explicit JSON nulls, fractional or overflowing numeric bounds and
+inconsistent options are rejected at build, before runtime assembly. Builders may remain partial until build.
+Optional nodeId, dataDirectory and advertisedEndpoint can be reset with null through builder methods;
+JSON callers omit these fields instead. Nested builder input, accessor and output JSON is copied.
+
+Defaults are a concrete localhost listener (`127.0.0.1:8080`), target three, static discovery with no endpoints,
+election timing 2500..5000 ms with 1000-ms heartbeats, one-second membership refresh, 30-second replacement delay,
+two standby learners and a 30-second graceful membership deadline. Empty discovery with the default target leaves formation
+pending; explicitly choose target one for single-node development. Bind a reachable IPv4 listener for deployment;
+`0.0.0.0` requires a concrete advertised callback endpoint. Optional initial/expected `nodeId` never renames existing storage.
+The default persistent directory uses the full SHA-256 digest of the UTF-8 group name, avoiding unsafe path characters;
+multiple processes on one machine require distinct explicit data directories and listener ports.
+
+`LeaderCoordinator.create(vertx, options, serverOptions, clientOptions)` accepts validated immutable options and copies HTTP settings,
+returning an unopened coordinator without filesystem or network I/O. Register handlers, then compose `listen()`.
+Startup opens and locks local storage, recovers identity and authority binding, validates TLS credentials and assembles
+transport, discovery and membership before starting participation. Startup failure releases acquired resources.
+Public lifecycle calls enter through owner-context dispatch;
+private start/leave/close operations continue on that owner. Startup invokes initialization directly rather than adding
+another context hop and promise bridge. Synchronous initialization errors follow the same startup cleanup path.
+Listener host/port come from `listen()`, `listen(port)`, or `listen(port, host)`, not LeaderOptions.
+Same-binding calls share startup; conflicting bindings fail. TLS uses standard Vert.x HTTP options.
+Startup completion confirms local listener/recovery startup, not voter admission or leader readiness; observe
+`leadershipHandler` for that. `identity()` is available after successful startup and remains available after shutdown;
+calling it before identity recovery throws IllegalStateException. `participant` exposes the admitted runtime for advanced
+proposals/diagnostics and fails while unavailable. `options()` returns the immutable startup options; `toBuilder()` creates an independent builder.
+
+With TLS enabled, server and client key material must have the persisted identity's URI SAN. The facade checks enumerable X.509 key aliases
+through standard Vert.x KeyCertOptions on a worker before participation; it does not weaken peer authentication or hostname
+verification. Custom key managers that cannot enumerate their certificate aliases use the lower-level transport API.
+For a fresh deployment, configure a readable nodeId matching provisioned certificates. Omitting nodeId recovers an existing
+identity or generates one through the store; TLS deployments require matching certificates provisioned before this facade
+can start. Initialize/read the low-level store first when using generated IDs with an external certificate issuer.
+A mismatched certificate fails startup and preserves the stored identity rather than regenerating it.
+
+Discovery is typed as `DiscoveryOptions.Static` or `DiscoveryOptions.Srv`, with JSON serialization supported.
+Static discovery uses `ipv4[:port][#expectedNodeId]` and defaults omitted ports to 8080 independently of the listener. SRV discovery uses
+`{"type":"srv","name":"_leader._tcp.example.net"}` with optional `dns` settings accepted through Vert.x DnsClientOptions.
+DNS host/port default to Vert.x's environment resolver; queryTimeout defaults to 1000 ms and is bounded to 1..5000 ms.
+The facade owns the DNS client it creates and closes it on startup failure, `close`, or graceful `leave` completion.
+It also owns controller, HTTP and store resources; it never closes the application's Vert.x instance.
+Closing before startup acquires no resources. Closing during initialization waits for accepted initialization work and releases
+resources acquired in the meantime; it does not permit late initialization to begin participation.
+
+`leadershipHandler`, `exceptionHandler`, startup/leave/close futures, and forwarded application snapshot hooks retain owner
+context behavior. `snapshotHandlers` must be registered before start and is forwarded before the participant recovers.
+The coordinator defaults background/subscriber errors to `Throwable::printStackTrace`; a custom exception handler replaces it,
+and null restores the default. Failed operation futures retain their separate failure results.
+`leave()` uses the configured deadline; `leave(timeoutMillis)` overrides one operation. `close()` cancels local work without
+promising removal, including during startup. Failed startup automatically releases owned resources.
+Persisted genesis always wins over a changed local target setting; configuration is startup input, not a runtime policy-update API.
+No new wire or durable-store version is introduced by this facade. The legacy LeaderConsensusOptions and API remain separate.
+
+Tests cover strict JSON defaults/types/bounds, targets 1/3/5/7/9/63, endpoint port inheritance, copy isolation, safe directory
+selection, real configured static and SRV startup, three-voter formation, graceful leave, retained-identity/target recovery,
+TLS identity mismatch, bind/start cancellation, ownership cleanup, caller Vert.x survival, callback contexts and snapshot restoration.
+
+== Application fencing token and example milestone
+
+`LeadershipToken(groupName, clusterId, term)` is an immutable positive fencing epoch. `VertxLeaderNode.fencingToken()`
+rechecks application readiness on the owner context before deriving it from the current durable cluster binding and term.
+`LeaderCoordinator.fencingToken()` forwards through the admitted participant and rejects requests while unavailable,
+leaving or closed. This adds no protocol message, durable field or new Raft write; readiness already requires a durable
+current-term commit and fresh effective-configuration quorum responses.
+
+The destination must enforce the highest accepted term atomically with every protected mutation, under an explicitly
+provisioned group/cluster binding. A new cluster UUID is never automatically greater than an old one. Tokens are neither
+leases nor signed proofs and do not provide authentication, operation deduplication or multi-resource transactions.
+An old request can succeed until the destination accepts a newer term; claiming the new token before application work
+establishes the destination's fence. Previously issued tokens cannot be revoked by changing local readiness alone.
+
+`LeadershipFencingTest` delays an old leader's application write, isolates its Raft messages, elects a replacement and
+registers/writes with the replacement's higher term. Releasing the old write then fails without changing the new value.
+Tests also cover wrong group/cluster rejection before fence advancement, equal-term writes, retained restart, readiness
+and drain/shutdown rejection. Existing held-write tests ensure no token is issued before current-term durability.
+
+link:raft-fencing.adoc[The application fencing guide] links the compiled callback-based destination example and a transactional
+SQL pattern. The example is an in-memory destination, not a production persistence/authentication adapter. Production
+destination recovery and database integration remain acceptance gates. The legacy leadership API remains unchanged.
+
+== Separate-JVM crash and recovery tests
+
+`RaftProcessTest` launches real Java processes running the configured LeaderCoordinator with independent directories,
+loopback mutual TLS listeners, and ordinary static discovery. Each child uses the same Java executable and test classpath
+as Maven, with bounded heap and thread pools. A test-only stdin/stdout control channel requests observations, coordination
+proposals and compaction; it does not add endpoints or fault switches to the production API. Application delivery is checked
+by a small idempotent state machine with asynchronous checkpoint/restore hooks.
+
+The process scenarios verify:
+
+* A forcibly terminated ready leader is replaced by a surviving majority, and acknowledged data survives successor election
+  and the old leader's restart with the same identity, original cluster binding and voting set.
+* Killing two voters demotes the remaining application's readiness, rejects new proposals and leaves the voting configuration
+  unchanged. The minority observation spans multiple election windows.
+* After all three JVMs are killed with snapshots installed, retained stores preserve identity, cluster/genesis, snapshot boundary,
+  commitment and monotonic term/vote. Restarting the two non-authority voters recovers application state and elects a leader
+  without forming a new cluster. The authority later rejoins and catches up with subsequent committed entries.
+* A second JVM cannot open a live process's directory, and its failed acquisition does not unlock the first owner.
+  A forcibly terminated owner releases the native OS lock. A checksum-damaged file causes startup failure and is not regenerated;
+  restoring the saved bytes permits normal recovery with the original identity.
+* A storage child is stopped at each STAGED, REPLACED and DURABLE compaction boundary, then forcibly killed before stack unwinding
+  or normal close can run. Recovery observes a complete old state before replacement or complete new checkpoint afterward,
+  including the unchanged cluster binding, and can reacquire directory ownership.
+
+Run just these scenarios with `mvn test -Dtest=RaftProcessTest`; they also run in the normal `mvn test`/`mvn clean verify` suite.
+The harness uses bounded asynchronous polling and captures each child's stdout/stderr for assertion diagnostics. Teardown kills
+all spawned processes before waiting for cleanup, including after test failures. Child JVMs run without the parent's coverage agent.
+No external cluster manager or service is required.
+
+These are process-crash tests on the host filesystem, not machine power-loss or disk-controller durability tests. The OS remains
+alive after a JVM is killed, including at the rename-before-directory-sync boundary. Deterministic simulator schedules still provide
+broader message reordering and membership-transition coverage; the process suite exercises concrete deployment/recovery paths.
+It does not establish exactly-once external job effects, production destination fencing or an exhaustive Raft proof.
+The separate fencing example tests above exercise a bounded application/destination contract.
+
+== Scope and operating model
+
+Provide leader election for scheduled work using a small Raft voting group inside a larger application deployment.
+Use direct HTTP transport, persistent local state, and automatic membership management.
+Only a voter elected leader may activate the application's leadership callback.
+Other application nodes observe leadership; a bounded number may become learners ready for promotion.
+
+The target voter count defaults to three, independently of application instance count.
+Support an explicit single-voter development configuration and larger odd targets, including five, seven, and nine.
+The target expresses desired membership; quorum always follows the effective Raft configuration.
+Never reduce quorum because nodes disappear from discovery.
+Once initialized, the cluster's replicated policy takes precedence over a joining node's local target setting.
+Subsequent target changes require an agreed policy update followed by serialized membership transitions.
+
+The first implementation replicates membership, coordination policy, and no-op entries.
+Application job commands and results are outside the log.
+Membership replication still requires a complete Raft log engine and its election safety rules.
+
+== Components
+
+[cols="1,3",options="header"]
+|===
+|Component |Responsibility
+|`RaftElection` |Deterministic election and log replication effects, independent of networking and wall-clock time.
+|Storage adapter |Vert.x future-based I/O and exclusive directory ownership; identity, hard state, log, bootstrap, snapshots.
+|`NodeDiscovery` |Static or SRV endpoints enriched by an identity handshake; failures reported separately.
+|`HttpRaftTransport` |Requests to specific members, identity checks, bounded retries, and protocol versioning.
+|`MembershipController` |Learner admission, catch-up, voter replacement, and serialized configuration changes.
+|`LeaderCoordinator` |Vert.x lifecycle, timers, persistence sequencing, and application callbacks.
+|===
+
+Process protocol events on one Vert.x context per group.
+Perform storage writes off the event loop, with dependent effects withheld until durability is confirmed.
+Serialize persistence and event processing so later transitions cannot overtake unfinished writes.
+Tag asynchronous work with a local lifecycle generation; responses from a previous start cannot mutate a restarted instance.
+
+== Configuration and discovery
+
+The following example describes a regular node using static discovery:
+
+[source,json]
+----
+{
+  "groupName": "scheduled-job",
+  "nodeId": "node-a",
+  "bootstrapAuthorityId": "node-a",
+  "dataDirectory": "./data/leader-node-a",
+  "advertisedEndpoint": "192.0.2.10",
+  "targetVoterCount": 3,
+  "discovery": {
+    "type": "static",
+    "endpoints": [
+      "192.0.2.10",
+      "192.0.2.11",
+      "192.0.2.12"
+    ]
+  }
+}
+----
+
+All nodes configure the same `bootstrapAuthorityId`. The node whose persisted ID matches that value forms genesis;
+there is no separate authority boolean or duplicate bootstrap endpoint. Discovery provides its route.
+The authority can also run application work on the same HTTP listener.
+Select a persistent data directory per process; never derive identity from an ephemeral Vert.x cluster node ID.
+An omitted directory defaults to `./.inqwise-leader/<sha256(groupName)>` for a single local process;
+multiple local processes require distinct directories.
+
+For this stage, static endpoint syntax is `ipv4[:port][#expectedNodeId]`.
+IPv6 and hostname literals in static endpoints are outside the initial parser scope.
+`listen()` defaults to 127.0.0.1:8080. Static discovery defaults omitted ports to 8080;
+advertised endpoints default omitted ports to the selected listening port.
+Nodes listening on a different port must have that port explicitly included in their endpoint.
+The authority route comes from discovery. Listener settings are runtime arguments, not option-file fields.
+SRV ports always come from their DNS records. The coordinator listen methods accept ports 1..65535; lower-level transport
+constructors also accept zero for ephemeral test listeners.
+
+[source,text]
+----
+192.0.2.10
+192.0.2.10#node-a
+192.0.2.10:8080#node-a
+192.0.2.11:9090
+----
+
+The parser removes the optional identity suffix before connection.
+Require four decimal IPv4 octets from 0 through 255, a port from 1 through 65535 when supplied,
+and a nonempty suffix when `#` is present.
+Reject ambiguous leading-zero octets, an empty explicit port, hostnames, IPv6, URL paths,
+credentials, additional fragments, and malformed entries rather than guessing their meaning.
+An omitted port uses the default; an explicitly invalid port is never replaced with the default.
+Advertised endpoints must contain a concrete address; `0.0.0.0` is only a listener bind address.
+An expected ID validates the remote identity; it never assigns that identity remotely.
+Readable IDs such as `node-a` require initial explicit `nodeId` configuration on that node.
+Otherwise generate a UUID once and persist it. Reject a configured ID that conflicts with existing state.
+
+SRV discovery uses an alternative discovery configuration:
+
+[source,json]
+----
+{
+  "type": "srv",
+  "name": "_inqwise-leader._tcp.example.net"
+}
+----
+
+For example, publish ordinary DNS records:
+
+[source,text]
+----
+_inqwise-leader._tcp.example.net. 300 IN SRV 0 0 8080 node-a.example.net.
+node-a.example.net.              300 IN A   192.0.2.10
+----
+
+Use Vert.x SRV resolution to enumerate host/port pairs, then contact each endpoint for identity.
+SRV targets remain standard DNS hostnames; the discovery adapter resolves them to IPv4 addresses for transport.
+SRV records supply their own ports, so the static endpoint port default does not apply to SRV results.
+Report targets without an IPv4 address as unavailable in this stage.
+Respect DNS caching and refresh behavior; retain existing member knowledge during DNS failures.
+Neither SRV disappearance nor a changed result ordering changes voting membership.
+Deduplicate returned node IDs and quarantine conflicting identity claims instead of counting them as different voters.
+Address changes require a verified handshake before replacing a member's cached route.
+Transport always targets an identified member; client load balancing must not distribute a vote request across members.
+
+== Identity and HTTP contract
+
+Use a versioned group-specific path, with the group safely encoded as one path segment.
+
+[cols="1,2,3",options="header"]
+|===
+|Method |Path suffix under `/leader/v1/groups/<group>` |Purpose
+|GET |`/identity` |Persisted node ID, group, optional cluster ID, protocol version and departure intent.
+|GET |`/bootstrap` |Read the authority's immutable initial record, or report that formation is pending.
+|POST |`/bootstrap/install` |Idempotently install the authority's initial record on a selected empty voter.
+|GET |`/membership` |Read authenticated term, leader readiness, genesis and effective configuration.
+|POST |`/join` |Request term-bound learner admission from the ready leader; followers reject the request.
+|POST |`/request-vote` |Term, candidate ID, last log index, and last log term; vote result is a separate `/vote-response` message.
+|POST |`/vote-response` |Correlated durable vote result; HTTP 202 only confirms dispatch.
+|POST |`/append-entries` |Leader term/ID, previous log index/term, entries, and commit index; empty entries are heartbeats.
+|POST |`/append-response` |Correlated durable replication result; HTTP 202 only confirms dispatch.
+|POST |`/install-snapshot` |Transfer a bounded full checkpoint for catch-up after compaction.
+|POST |`/snapshot-response` |Acknowledge durable checkpoint installation and application restoration.
+|POST |`/leave` |Authenticated self-removal; returns committed stable removal evidence.
+|===
+
+`HttpRaftTransport.forBootstrap` reports a null cluster ID for unassigned nodes and a durable genesis cluster ID
+for assigned nodes. The explicit fixed-voter constructor still accepts an agreed cluster ID for manual configuration.
+Raft messages include group, cluster ID, sender ID, intended receiver ID, protocol version, and request correlation.
+Reject cluster/receiver mismatches before changing protocol state.
+Retry safely under duplicate, delayed, reordered, or failed requests; ignore stale responses.
+Bound message sizes, batch sizes, connection timeouts, and concurrent requests.
+Support TLS and authenticated peer admission; a self-reported node ID alone is not authentication.
+Bootstrap installation requires authority authentication and is rejected for incompatible existing state.
+
+== Initial bootstrap and restart
+
+For the first version, use one explicitly designated bootstrap authority with exclusive ownership of durable storage.
+DNS locates that authority; DNS ordering never elects one.
+Operators must not run independent authorities for the same group or replace an authority with empty storage.
+This is an initial-formation availability dependency, not an election or membership authority after formation.
+
+. Collect eligible, verified identities until the initial target is available; do not silently form a smaller group.
+. Select unique initial voters and atomically persist one immutable record before sending any installation response.
+  The record contains a generated cluster UUID, group name, initial voter IDs, initial policy, and a record digest.
+. Send that exact record to the selected voters. Each stores it durably as its common genesis configuration
+  before participating in an election. Installation is idempotent; an incompatible record is rejected.
+. Retry interrupted installation with the same record, including after authority restart.
+  Do not select a replacement initial set because formation is taking too long.
+. Once a leader exists, new arrivals join that cluster through the leader.
+  The initial record remains a cluster-identity anchor; it is not the current voter configuration.
+
+Existing nodes always recover local Raft state before processing discovery results.
+Established clusters can restart and admit new members without the bootstrap authority when members are reachable.
+Fresh nodes that can reach neither the authority nor an existing cluster wait.
+If discovery exposes different cluster IDs for the same group, report the conflict and suspend automatic admission.
+Never merge clusters or bootstrap a new one on quorum loss.
+Permanent quorum loss or authority storage loss requires an explicit recovery procedure;
+recovery must also address stale nodes and previously issued fencing tokens.
+
+== Durable state and protocol baseline
+
+Use the https://raft.github.io/raft.pdf[Raft paper, Figure 2 and sections 5-7] as the normative baseline.
+Persist `currentTerm`, `votedFor`, and log changes before dependent protocol replies.
+Require one vote per term, log freshness checks, higher-term demotion, randomized elections,
+and distinct-voter majorities. Replicate with previous-entry checks, conflict repair, and ordered application.
+Advance commitment using the current-term majority rule.
+Use joint consensus for membership, with separate old/new majorities for elections and commitment.
+Apply configuration effectiveness when entries enter the log, not only after commitment;
+handle rollback and recovery according to the baseline.
+
+Persist identity, cluster binding, genesis record, hard state, and a recoverable log format with versioning and checksums.
+Use atomic creation/replacement and file/directory synchronization where required for durability.
+An incomplete write must be distinguishable from durable acknowledged state.
+Corrupt durable state or storage errors stop voting and application leadership; never regenerate identity or reset term.
+Hold an exclusive local lock for the store lifetime to prevent concurrent use of the same state.
+Snapshots preserve the included index/term and configuration at that point; retain later log entries.
+Snapshot installation and compaction must survive interruption before enabling unbounded deployments.
+
+== Automatic membership policy
+
+The leader manages membership toward the replicated target policy.
+Existing healthy voters remain selected when other nodes arrive; avoid periodic reshuffling.
+Keep a bounded learner pool and promote only after catch-up to a defined committed index is durably acknowledged.
+Serialize transitions from stable configuration through joint configuration to a committed final configuration.
+A successor leader resumes or safely resolves an interrupted transition before starting another.
+The controller must respect uncommitted effective configurations during elections and transitions.
+
+For graceful departure, wait for final removal before completing the leave request.
+A departing leader stops application work and relinquishes leadership as removal completes.
+A learner or observer cannot campaign or contribute a vote.
+
+For unexpected disappearance, mark the voter unreachable and wait for a configurable replacement delay.
+Replace it only while the current configuration can authorize the change and a caught-up replacement is available.
+Prefer replacement that restores the target rather than repeatedly shrinking the voting group.
+No discovery event, elapsed delay, or controller restart can override the quorum requirement.
+Returning removed nodes must rejoin through admission; their old membership is not automatically restored.
+Enforce the baseline's removed-node election-disruption protections as part of the membership implementation.
+
+== Application leadership and lifecycle
+
+Expose a richer callback alongside a compatibility path for the existing boolean callback:
+
+[source,java]
+----
+record Leadership(boolean leader, long term, String leaderId) {}
+record LeadershipToken(String groupName, String clusterId, long term) {}
+----
+
+Distinguish protocol election from permission to activate application work.
+Activate work only after committing a current-term no-op and confirming current quorum communication.
+Track fresh responses for quorum checks; during a joint configuration require both majorities.
+Demote application leadership when quorum confirmation expires, a higher term is accepted,
+the local member is removed, storage fails, or shutdown begins.
+Emit each activation/demotion transition once and isolate subscriber exceptions from protocol resource cleanup.
+
+Quorum checks limit stale leadership but cannot guarantee exclusive external effects during partitions or pauses.
+Expose the term as a fencing epoch within the persisted cluster identity.
+The destination resource must be bound to the authorized cluster and reject older epochs after accepting a newer one.
+A new cluster UUID does not automatically supersede an old cluster's authority over the same resource.
+Timer cancellation does not cancel in-flight jobs or provide exactly-once execution.
+
+Use asynchronous startup and graceful-leave/shutdown APIs so callers can observe readiness and removal completion.
+Bound graceful shutdown waits; process termination may occur without committed removal, leaving a failed voter to replace later.
+Cancel owned work, release the local store lock, and invalidate callbacks on stop.
+The Raft engine uses no Vert.x distributed lock and requires no clustered Vert.x instance.
+
+== Acceptance tests
+
+Implement these tests incrementally with a simulated clock, seeded randomness, controllable transport, and crashable storage.
+Test the state machine first, then reuse scenarios with real HTTP nodes and separate data directories.
+
+[cols="1,3",options="header"]
+|===
+|Area |Required scenarios
+|Persistence |Stable ID across restart; conflicting ID rejected; directory ownership enforced; crash at every durability
+boundary; duplicate vote after restart prevented; corruption fails closed.
+|Discovery/parser |IPv4 with/without port and expected ID; default and overridden listen port; rejected hostname/IPv6,
+invalid octets, empty/out-of-range ports, and malformed IDs; handshake mismatch, duplicate IDs, changed addresses,
+SRV targets resolving to IPv4, targets without IPv4, stale SRV answers, DNS failures, and foreign clusters.
+|Bootstrap |Simultaneous requests produce one record; fewer than the target wait; crash before/after record durability;
+partial installation reuses the original set; a conflicting installation is rejected; authority absence never reforms a cluster.
+|Election |Simultaneous candidacy; duplicate and old-term messages; higher-term demotion; one elected leader per term;
+minority cannot elect; majority elects after communication stabilizes.
+|Replication |Conflicting suffix repair; old-term entries not committed by counting alone; applied prefixes agree;
+snapshot interruption, restart, and learner catch-up.
+|Membership |Target three with more discovered nodes; non-voters cannot campaign; learner promotion;
+leader crash at every transition boundary; partitions across old/new majorities; removal of the current leader;
+return of a removed member; quorum loss prevents replacement.
+|Application |No activation before readiness; quorum-loss demotion; stale response after restart ignored;
+callback exceptions release resources; destination rejects older fencing epochs after newer acceptance.
+|Vert.x runtime |Owner-context affinity for events/completions; responsive event loop during disk I/O; serialized writes
+under delayed completion; no mutex-based runtime state; startup cancellation and late lock acquisition cleanup.
+|Integration |Real HTTP with independent Vert.x instances; request retries/timeouts; authenticated admission and identity
+checks; graceful and abrupt process exit; full cluster restart using existing storage.
+|===
+
+Continuously check safety invariants after every simulated event, rather than only checking final convergence.
+Use bounded randomized schedules and retain failing seeds as regression cases.
+Run Java 21 Maven tests and clean verification before release; use a compatible coverage runtime.
+
+== Delivery sequence and compatibility
+
+. Implement store and endpoint parsing contracts with durability and validation tests.
+. Build the deterministic engine and simulator for fixed-membership election and log replication.
+. Refactor runtime-facing storage to Vert.x futures, asynchronous filesystem operations, and owner-context dispatch.
+  Preserve durability guarantees and native ownership protections through the smallest necessary adapters.
+. Integrate authenticated HTTP and explicit static/SRV discovery passes (implemented before membership integration).
+. Persist immutable cluster/genesis binding and bootstrap installation (implemented).
+. Add joint membership, learner catch-up, and joint quorum confirmation tests (implemented).
+. Add snapshots and log compaction with bounded retained tails and application recovery hooks (implemented).
+. Add automatic discovery/admission/replacement and controller lifecycle (implemented).
+. Add bounded graceful leave and committed removal acknowledgment (implemented).
+. Add JSON/builder configuration and an owning Vert.x lifecycle facade (implemented).
+. Run separate-JVM crash/restart, native-lock and persistence-boundary scenarios (implemented).
+. Publish deployment and recovery guidance (implemented in link:raft-operations.adoc[the operations guide]).
+. Add ready leadership tokens and a destination-enforced fencing example with delayed-work tests (implemented).
+. Complete production destination fencing integration and deployment/recovery acceptance gates, including backup restoration.
+
+Retain the current implementation until the replacement passes the acceptance gates.
+Introduce a separate opt-in API/protocol version first; do not silently reinterpret existing options.
+Legacy participants cannot vote in the new protocol, and old in-memory state cannot migrate into a Raft store.
+Plan a coordinated job handover so legacy and Raft groups do not independently run the same job.
+Publish the deployment, bootstrap backup, recovery, authentication, and fencing requirements before enabling production use.
+
+== References
+
+* https://raft.github.io/raft.pdf[Raft protocol: Figure 2; election and safety in section 5; membership in section 6; snapshots in section 7].
+* https://vertx.io/docs/vertx-service-resolver/java/[Vert.x Service Resolver: endpoint resolution and SRV discovery].
+* https://vertx.io/docs/apidocs/io/vertx/core/dns/DnsClient.html[Vert.x DNS client: direct SRV lookup].
+* https://vertx.io/docs/apidocs/io/vertx/core/file/AsyncFile.html[Vert.x asynchronous files: flushing and file ownership locks].
+* https://vertx.io/docs/apidocs/io/vertx/core/file/CopyOptions.html[Vert.x atomic file move options].

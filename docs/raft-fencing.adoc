@@ -1,0 +1,132 @@
+= Fencing Application Writes
+
+`LeaderCoordinator.fencingToken()` and `VertxLeaderNode.fencingToken()` return a `Future<LeadershipToken>`.
+The immutable token contains `groupName`, the persisted `clusterId`, and the current positive Raft `term`.
+The participant rechecks application readiness before issuing it: the current term must have a durable commit and fresh
+quorum confirmation. Followers, learners, draining nodes and stopped nodes cannot issue a token.
+The coordinator also rejects requests before startup, during departure and after shutdown.
+
+A token records an epoch, not continuing permission to lead. It has no expiry, signature or automatic revocation.
+Do not construct application tokens from cached leadership observations; request them through the coordinator/runtime API.
+The destination must authenticate and authorize writers and must trust their use of coordinator-issued tokens.
+A constructible Java value is not a cryptographic quorum certificate.
+
+== The destination enforces the fence
+
+Provision each resource with its authorized group and cluster from trusted deployment/genesis information.
+Never bind a resource automatically to the first incoming token. Cluster IDs are identifiers, not ordered epochs:
+a different UUID cannot supersede an existing binding, even when its term is larger.
+
+At the destination, both claim and write must:
+
+. Reject a different group or cluster before changing any destination state.
+. Reject a term smaller than the highest term already accepted for that resource.
+. Advance the highest term and perform the requested mutation atomically.
+
+A new leader registers its token with the destination before starting work there. Every subsequent write also carries the
+token and performs the check. An earlier request may still succeed until the destination has accepted the higher term;
+election alone does not synchronously invalidate requests at an external service. After accepting a higher term, the
+destination rejects all older terms for the same binding.
+
+Equal terms are allowed so one leader can make multiple writes. This does not order jobs within a term, deduplicate retries,
+or provide exactly-once effects. Resources that need those properties must enforce operation IDs or application ordering too.
+Each external resource must participate; this mechanism does not make operations spanning multiple destinations atomic.
+
+This destination-enforced boundary follows the fencing protocol described in
+https://hazelcast.com/blog/long-live-distributed-locks/[Hazelcast's fencing explanation].
+The behavior of this project's token API and destination example is exercised by `LeadershipFencingTest`.
+
+== Compiled Vert.x example
+
+link:../src/test/java/com/inqwise/leader/examples/FencedRegister.java[FencedRegister] is a compiled, callback-driven example
+under test sources. It is not shipped in the library. It represents the destination resource itself: a single Vert.x owner
+context checks the token and changes the value in one handler, with no asynchronous gap between them.
+It cannot protect an unchecked mutation in another service after this local check.
+
+After a readiness notification, one example operation is:
+
+[source,java]
+----
+// Provision this destination independently with the trusted group and persisted cluster ID.
+var destination = new FencedRegister(destinationContext, expectedGroup, expectedClusterId);
+
+coordinator.fencingToken().compose(token ->
+    Future.<Void>future(done -> destination.claim(token, done))
+        .compose(ignored -> Future.<Void>future(done -> destination.write(token, "result", done)))
+).onFailure(this::handleFailure);
+----
+
+Continue stopping/canceling application scheduling when readiness becomes false. In-flight work may still hold an older token;
+its destination check remains necessary even when the local application already observed demotion.
+The example's state is in memory. Restarting it loses its highest accepted term and therefore loses the fence.
+A production destination must recover its durable binding and highest term before accepting writers.
+
+== Transactional SQL pattern
+
+For a PostgreSQL destination, the protected data and its fence can occupy the same row:
+
+[source,sql]
+----
+CREATE TABLE fenced_resource (
+    resource_id TEXT PRIMARY KEY,
+    group_name TEXT NOT NULL,
+    cluster_id TEXT NOT NULL,
+    highest_term BIGINT NOT NULL DEFAULT 0 CHECK (highest_term >= 0),
+    payload TEXT
+);
+----
+
+Provision the row's resource/group/cluster binding through trusted administration. To claim an epoch, bind parameters
+as term, resource ID, group name and cluster ID:
+
+[source,sql]
+----
+UPDATE fenced_resource
+SET highest_term = $1
+WHERE resource_id = $2
+  AND group_name = $3
+  AND cluster_id = $4
+  AND $1 > 0
+  AND highest_term <= $1;
+----
+
+To mutate, bind term, new payload, resource ID, group name and cluster ID:
+
+[source,sql]
+----
+UPDATE fenced_resource
+SET highest_term = $1, payload = $2
+WHERE resource_id = $3
+  AND group_name = $4
+  AND cluster_id = $5
+  AND $1 > 0
+  AND highest_term <= $1;
+----
+
+Exactly one affected row means acceptance; zero means rejection or missing provisioning. Handle both as explicit outcomes.
+A separate SELECT/check followed by an unchecked UPDATE leaves a race. Likewise, a successful claim followed by an unchecked
+write cannot fence delayed work. Keep the check and mutation in the destination's atomic transaction/statement and preserve
+the fence across crashes and backups. Use a 64-bit integer for the term throughout the application/driver path.
+
+These SQL statements document an integration pattern; the Maven tests do not connect to PostgreSQL or validate an application
+schema. Test transaction isolation, persistence, access permissions and restart behavior against the actual chosen destination.
+Rebinding to a replacement cluster is a separate privileged recovery/migration operation, with old participants isolated and
+application data/uncertain operations reconciled. The library and example expose no automatic reset/rebind operation.
+
+== Acceptance evidence
+
+Run `mvn test -Dtest=LeadershipFencingTest,LeaderCoordinatorTest,VertxLeaderNodeTest` or the full Maven suite.
+The tests exercise real runtime nodes and durable Raft stores with controlled message loss, plus the independent destination
+context. They verify:
+
+* An old leader's application write can be held while the remaining voters elect a higher-term replacement.
+* The old token is still usable before the destination observes the new term, making the boundary explicit.
+* After the replacement claims and writes, resuming that held write fails and preserves the replacement's data.
+* Foreign group/cluster tokens cannot advance the fence or mutate data, even with a much larger term.
+* Repeated claims and writes within one term work; they are not operation deduplication.
+* Tokens are unavailable before readiness/durable current-term commitment, on followers, while draining and after close.
+* Retained-storage restart yields a higher-term token within the original cluster; coordinator tokens match durable genesis
+  and complete on the owning context.
+
+The paused component in the failover test is the application write, not the whole JVM. Destination crash recovery, production
+database behavior, caller authentication and multi-resource application correctness remain deployment-specific acceptance work.
