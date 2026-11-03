@@ -25,7 +25,7 @@ import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.RequestOptions;
 
 /** Shared HTTP pool and bounded exchange registry. All methods and callbacks run on the owner context. */
-final class HttpRaftClient {
+final class HttpRaftClient implements RaftRpcClient {
 	private static final Logger LOG = LogManager.getLogger(HttpRaftClient.class);
 	static final String NODE_HEADER = "X-Inqwise-Node-Id";
 	@FunctionalInterface interface Encoder { Buffer encode() throws Exception; }
@@ -50,7 +50,7 @@ final class HttpRaftClient {
 		client = context.owner().createHttpClient(options);
 	}
 
-	RaftConnection connection(NodeEndpoint endpoint) { return new HttpRaftConnection(this, endpoint); }
+	public RaftConnection connection(NodeEndpoint endpoint) { return new HttpRaftConnection(this, endpoint); }
 
 	<T> void request(NodeEndpoint endpoint, HttpMethod method, String suffix, Encoder encoder, Decoder<T> decoder,
 		boolean large, Completable<T> completion) {
@@ -75,7 +75,7 @@ final class HttpRaftClient {
 		}
 	}
 
-	Future<Void> close() {
+	public Future<Void> close() {
 		if (closeResult == null) {
 			// Mark closed before callbacks can submit new work.
 			closeResult = ContextDispatch.promise(context);

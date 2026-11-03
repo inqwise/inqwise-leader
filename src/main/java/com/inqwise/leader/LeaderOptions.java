@@ -19,7 +19,7 @@ import io.vertx.core.json.JsonObject;
 public final class LeaderOptions {
 	private static final Set<String> KEYS = Set.of("groupName", "bootstrapAuthorityId", "nodeId", "dataDirectory",
 		"advertisedEndpoint", "targetVoterCount", "discovery", "timing", "membership",
-		"leaveTimeoutMillis");
+		"leaveTimeoutMillis", "transport");
 	private final JsonObject json;
 	private final DiscoveryOptions discovery;
 
@@ -54,6 +54,14 @@ public final class LeaderOptions {
 	 */
 	public JsonObject toJson() { return json.copy(); }
 
+	/**
+	 * Selects node communication without changing durable cluster membership.
+	 * @return "tcp" (default) or "http"; all peers must use the same transport
+	 */
+	public String getTransport() {
+		String value = optionalText(json, "transport");
+		return value == null ? "tcp" : value;
+	}
 	/**
 	 * Reads this configuration value.
 	 * @return configured consensus group
@@ -153,6 +161,7 @@ public final class LeaderOptions {
 
 	private void validate() {
 		checkKeys(json, KEYS);
+		if (!Set.of("http", "tcp").contains(getTransport())) throw new IllegalArgumentException("Unknown transport");
 		new RaftIdentity(getNodeId() == null ? "validation" : getNodeId(), Objects.requireNonNull(getGroupName(), "groupName"));
 		RaftIdentity.validateNodeId(Objects.requireNonNull(getBootstrapAuthorityId(), "bootstrapAuthorityId"));
 		if (getTargetVoterCount() % 2 == 0) throw new IllegalArgumentException("targetVoterCount must be odd");
@@ -176,6 +185,12 @@ public final class LeaderOptions {
 			this.json.mergeIn(Objects.requireNonNull(json, "json").copy());
 		}
 
+		/**
+		 * Selects the communication protocol. TCP is the default; HTTP requires explicit selection.
+		 * @param value "http" or "tcp"; use the same value on every peer
+		 * @return this builder
+		 */
+		public Builder transport(String value) { return put("transport", value); }
 		/**
 		 * Sets the required consensus group.
 		 * @param value group name

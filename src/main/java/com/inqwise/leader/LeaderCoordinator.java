@@ -15,9 +15,11 @@ import io.vertx.core.Handler;
 import io.vertx.core.dns.DnsClient;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpServerOptions;
+import io.vertx.core.net.NetServerOptions;
+import io.vertx.core.net.NetClientOptions;
 
 /**
- * Opt-in Vert.x lifecycle facade for configured Raft storage, HTTP, discovery and automatic membership.
+ * Opt-in Vert.x lifecycle facade for configured Raft storage, node communication, discovery and automatic membership.
  * Owns resources it creates, including an SRV DNS client; the application's Vert.x instance remains caller-owned.
  */
 public final class LeaderCoordinator {
@@ -30,12 +32,14 @@ public final class LeaderCoordinator {
 	private final LeaderOptions options;
 	private final HttpServerOptions serverOptions;
 	private final HttpClientOptions clientOptions;
+	private final NetServerOptions tcpServerOptions;
+	private final NetClientOptions tcpClientOptions;
 	private AsyncRaftStore store;
 	private Function<RaftElection.SnapshotPoint, Future<String>> snapshotProvider;
 	private Function<RaftSnapshot, Future<Void>> snapshotRestorer;
 	private Handler<RaftLogEntry> committedHandler;
 	private MembershipController controller;
-	private RaftClusterTransport http;
+	private RaftClusterTransport transport;
 	private DnsClient dns;
 	private RaftIdentity identity;
 	private Status status = Status.NEW;
@@ -53,10 +57,18 @@ public final class LeaderCoordinator {
 		HttpServerOptions serverOptions, HttpClientOptions clientOptions) {
 		this.context = context; this.options = options;
 		this.serverOptions = serverOptions; this.clientOptions = clientOptions;
+		this.tcpServerOptions = null; this.tcpClientOptions = null;
+	}
+
+	private LeaderCoordinator(Context context, LeaderOptions options,
+		NetServerOptions serverOptions, NetClientOptions clientOptions) {
+		this.context = context; this.options = options;
+		this.tcpServerOptions = serverOptions; this.tcpClientOptions = clientOptions;
+		this.serverOptions = null; this.clientOptions = null;
 	}
 
 	/**
-	 * Creates an unopened local plaintext singleton: group "default", identity/authority "node-a", port 8080.
+	 * Creates an unopened local plaintext TCP singleton: group "default", identity/authority "node-a", port 8080.
 	 * Uses the group-derived persistent directory. Explicit options retain their default target of three voters.
 	 * @param vertx application-owned Vert.x instance
 	 * @return unopened development coordinator
@@ -73,12 +85,14 @@ public final class LeaderCoordinator {
 	 * @return unopened coordinator
 	 */
 	public static LeaderCoordinator create(io.vertx.core.Vertx vertx, LeaderOptions options) {
-		return create(vertx, options, new HttpServerOptions(), new HttpClientOptions());
+		return "tcp".equals(options.getTransport())
+			? create(vertx, options, new NetServerOptions(), new NetClientOptions())
+			: create(vertx, options, new HttpServerOptions(), new HttpClientOptions());
 	}
 
 	/**
 	 * Creates an unopened coordinator without filesystem or network I/O. Register handlers, then call {@link #listen()}.
-	 * Accepts validated immutable Raft options and defensively copies HTTP options.
+	 * Accepts explicit transport("http") Raft options and defensively copies HTTP options.
 	 * Storage recovery, credential validation and resource acquisition occur asynchronously during start.
 	 * @param vertx application-owned Vert.x instance
 	 * @param options immutable Raft options created through LeaderOptions.builder()
@@ -88,6 +102,7 @@ public final class LeaderCoordinator {
 	 */
 	public static LeaderCoordinator create(io.vertx.core.Vertx vertx, LeaderOptions options,
 		HttpServerOptions serverOptions, HttpClientOptions clientOptions) {
+		if (!"http".equals(options.getTransport())) throw new IllegalArgumentException("HTTP options require http transport");
 		Context context = Objects.requireNonNull(vertx, "vertx").getOrCreateContext();
 		if (!context.isEventLoopContext()) throw new IllegalArgumentException("An event-loop context is required");
 		return new LeaderCoordinator(context, Objects.requireNonNull(options, "options"),
@@ -95,22 +110,49 @@ public final class LeaderCoordinator {
 			new HttpClientOptions(Objects.requireNonNull(clientOptions, "clientOptions")));
 	}
 
+	/**
+	 * Creates a TCP coordinator with defensively copied listener/client options.
+	 * @param vertx application-owned runtime
+	 * @param options startup options using TCP (the default)
+	 * @param serverOptions listener/TLS options; listen() supplies host and port
+	 * @param clientOptions client options; TLS requires HTTPS hostname verification and mutual authentication
+	 * @return unopened TCP coordinator
+	 */
+	public static LeaderCoordinator create(io.vertx.core.Vertx vertx, LeaderOptions options,
+		NetServerOptions serverOptions, NetClientOptions clientOptions) {
+		if (!"tcp".equals(options.getTransport())) throw new IllegalArgumentException("TCP options require tcp transport");
+		Context context = Objects.requireNonNull(vertx, "vertx").getOrCreateContext();
+		if (!context.isEventLoopContext()) throw new IllegalArgumentException("An event-loop context is required");
+		return new LeaderCoordinator(context, options,
+			new NetServerOptions(Objects.requireNonNull(serverOptions, "serverOptions")),
+			new NetClientOptions(Objects.requireNonNull(clientOptions, "clientOptions")));
+	}
+
 	private Future<Void> initialize() {
 		if (status != Status.STARTING) throw new CancellationException("Startup canceled");
 		return DataDirectories.resolve(context, options).compose(directory -> {
 			if (status != Status.STARTING) throw new CancellationException("Startup canceled");
 			store = VertxRaftStore.create(context.owner(), directory, options.getGroupName(), options.getNodeId());
-			serverOptions.setHost(listenHost).setPort(listenPort);
 			var bootstrap = new RaftBootstrap(store, options.getBootstrapAuthorityId(), options.getTargetVoterCount());
-			return HttpRaftTransport.forBootstrap(bootstrap, serverOptions, clientOptions);
+			if (tcpServerOptions != null) {
+				tcpServerOptions.setHost(listenHost).setPort(listenPort);
+				return TcpRaftTransport.forBootstrap(bootstrap, tcpServerOptions, tcpClientOptions)
+					.map(value -> (RaftClusterTransport) value);
+			}
+			serverOptions.setHost(listenHost).setPort(listenPort);
+			return HttpRaftTransport.forBootstrap(bootstrap, serverOptions, clientOptions)
+				.map(value -> (RaftClusterTransport) value);
 		}).compose(transport -> {
-			http = transport;
+			this.transport = transport;
 			return store.identity();
 		}).compose(recovered -> {
-			if (!serverOptions.isSsl()) return Future.succeededFuture(recovered);
+			boolean ssl = tcpServerOptions == null ? serverOptions.isSsl() : tcpServerOptions.isSsl();
+			if (!ssl) return Future.succeededFuture(recovered);
 			return context.executeBlocking(() -> {
-				RaftTlsIdentity.validateCredentials(context.owner(), serverOptions.getKeyCertOptions(), recovered.nodeId());
-				RaftTlsIdentity.validateCredentials(context.owner(), clientOptions.getKeyCertOptions(), recovered.nodeId());
+				var serverKeys = tcpServerOptions == null ? serverOptions.getKeyCertOptions() : tcpServerOptions.getKeyCertOptions();
+				var clientKeys = tcpClientOptions == null ? clientOptions.getKeyCertOptions() : tcpClientOptions.getKeyCertOptions();
+				RaftTlsIdentity.validateCredentials(context.owner(), serverKeys, recovered.nodeId());
+				RaftTlsIdentity.validateCredentials(context.owner(), clientKeys, recovered.nodeId());
 				return recovered;
 			}, true);
 		}).compose(recovered -> {
@@ -123,7 +165,7 @@ public final class LeaderCoordinator {
 					yield new SrvNodeDiscovery(context, dns, service.name());
 				}
 			};
-			controller = new MembershipController(store, http, discovery,
+			controller = new MembershipController(store, transport, discovery,
 				options.getMembershipOptions(listenPort), options.getTiming(), RandomGenerator.getDefault());
 			controller.leadershipHandler(this::observeLeadership).exceptionHandler(this::report);
 			return snapshotProvider == null ? Future.succeededFuture()
@@ -278,7 +320,7 @@ public final class LeaderCoordinator {
 	public Future<NodeEndpoint> localEndpoint() {
 		return ContextDispatch.call(context, () -> {
 			if (status != Status.RUNNING && status != Status.LEAVING) throw new IllegalStateException("Listener is not running");
-			return options.getMembershipOptions(listenPort).advertisedEndpoint() == null ? http.localEndpoint()
+			return options.getMembershipOptions(listenPort).advertisedEndpoint() == null ? transport.localEndpoint()
 				: Future.succeededFuture(options.getMembershipOptions(listenPort).advertisedEndpoint());
 		});
 	}
@@ -332,7 +374,7 @@ public final class LeaderCoordinator {
 		if (cleanupFuture == null) {
 			Future<Void> participation = controller != null ? controller.close()
 				: store == null ? Future.succeededFuture() : store.close();
-			Future<Void> network = controller != null || http == null ? Future.succeededFuture() : http.close();
+			Future<Void> network = controller != null || transport == null ? Future.succeededFuture() : transport.close();
 			Future<Void> resolution = dns == null ? Future.succeededFuture() : dns.close();
 			cleanupFuture = Future.join(participation, network, resolution).mapEmpty();
 		}

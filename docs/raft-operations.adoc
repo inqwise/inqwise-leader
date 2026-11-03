@@ -32,7 +32,7 @@ DNS changes alone never change the voter set or quorum.
 The two simpler coordinator factories use plaintext and accept self-reported identities for trusted development networks.
 The zero-configuration factory is a local one-voter preset; explicit options still default to three voters.
 For authenticated deployment, provision server and client TLS credentials for each identity, with the listener IP SAN for hostname verification.
-Configure mutual trust for the group's authorized peers using standard Vert.x HTTP TLS options.
+Configure mutual trust for the group's authorized peers using standard Vert.x TCP TLS options by default, or HTTP TLS options with explicit `transport("http")`.
 Keep production credentials separate from the repository's test fixtures.
 The protocol assumes non-Byzantine participants authorized by that trust policy.
 
@@ -59,11 +59,11 @@ The implementation rejects conflicting bindings; it does not merge independently
 == Application lifecycle and checkpoints
 
 Compose startup and shutdown with Vert.x futures on the application lifecycle.
-Synchronous `create()` accepts immutable options and copies HTTP settings without acquiring resources.
+Synchronous `create()` accepts immutable options and copies the selected transport settings without acquiring resources.
 Register handlers, then compose `listen()`.
 Retain the coordinator and eventually call `leave()` or `close()` after starting it. Closing an unopened instance is safe.
 Read `identity()` after successful startup; storage recovery determines the persisted identity.
-The coordinator owns its HTTP, store and SRV DNS resources; the application owns its Vert.x instance.
+The coordinator owns its transport, store and SRV DNS resources; the application owns its Vert.x instance.
 Do not block an event loop while waiting for startup, replication, checkpointing or shutdown.
 Unregistered coordinator exception handlers default to ERROR logging with the cause on the owner context;
 `exceptionHandler(null)` restores that default. A custom handler replaces it. Handle failed operation futures separately.
@@ -147,7 +147,7 @@ before enabling work. This migration is not automated or validated by the curren
 
 == Upgrade and deployment acceptance
 
-Use matching protocol builds across the group. The current workspace HTTP wire version is 4 and store version is 5;
+Use matching protocol builds across the group. The current workspace TCP framing version is 1, shared payload/HTTP wire version is 4 and store version is 5;
 these numbers are distinct. Older store decoding is not a promise of binary downgrade or rolling wire compatibility.
 Use a coordinated stop/start with retained directories for incompatible wire changes.
 Plan a separate application handover from legacy `LeaderConsensus` so the two protocols cannot independently run the same work.

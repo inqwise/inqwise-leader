@@ -21,6 +21,16 @@ class LeaderOptionsTest {
 	static JsonObject minimal() {
 		return new JsonObject().put("groupName", "scheduled-job").put("bootstrapAuthorityId", "node-a");
 	}
+	@Test void transportSelectionRoundTripsAndRejectsUnknownProtocols() {
+		assertEquals("tcp", LeaderOptions.builder(minimal()).build().getTransport());
+		var http = LeaderOptions.builder(minimal()).transport("http").build();
+		assertEquals("http", LeaderOptions.builder(http.toJson()).build().getTransport());
+		var tcp = LeaderOptions.builder(minimal()).transport("tcp").build();
+		assertEquals("tcp", tcp.getTransport());
+		assertEquals("tcp", LeaderOptions.builder(tcp.toJson()).build().getTransport());
+		assertThrows(IllegalArgumentException.class, () -> LeaderOptions.builder(minimal()).transport("udp").build());
+	}
+
 	@Test void builderReuseAndDerivedOptionsCannotMutatePreviouslyBuiltConfiguration() {
 		var discovery = new JsonObject().put("type", "static")
 			.put("endpoints", new JsonArray().add("127.0.0.1"));

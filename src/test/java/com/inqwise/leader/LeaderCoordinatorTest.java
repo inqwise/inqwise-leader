@@ -2,8 +2,8 @@ package com.inqwise.leader;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static com.inqwise.leader.VertxRaftStoreTest.await;
-import static com.inqwise.leader.HttpRaftTransportTest.clientOptions;
-import static com.inqwise.leader.HttpRaftTransportTest.serverOptions;
+import static com.inqwise.leader.TcpRaftTransportTest.clientOptions;
+import static com.inqwise.leader.TcpRaftTransportTest.serverOptions;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -55,7 +55,11 @@ class LeaderCoordinatorTest {
 	}
 	LeaderCoordinator create(Vertx vertx, LeaderOptions options, String tlsId) throws Exception {
 		var coordinator = tlsId == null ? LeaderCoordinator.create(vertx, options)
-			: LeaderCoordinator.create(vertx, options, serverOptions(tlsId), clientOptions(tlsId));
+			: "tcp".equals(options.getTransport())
+				? LeaderCoordinator.create(vertx, options, TcpRaftTransportTest.serverOptions(tlsId),
+					TcpRaftTransportTest.clientOptions(tlsId))
+				: LeaderCoordinator.create(vertx, options, HttpRaftTransportTest.serverOptions(tlsId),
+					HttpRaftTransportTest.clientOptions(tlsId));
 		coordinator.exceptionHandler(cause -> {}); coordinators.add(coordinator); return coordinator;
 	}
 	<T> T eventually(Vertx vertx, Supplier<Future<T>> read, Predicate<T> condition) throws Exception {
@@ -149,6 +153,7 @@ class LeaderCoordinatorTest {
 	@Test void defaultFactoryIsAnUnopenedLocalSingletonAndBuilderStillDefaultsToThreeVoters() throws Exception {
 		var coordinator = LeaderCoordinator.create(runtime()); coordinators.add(coordinator);
 		assertEquals("default", coordinator.options().getGroupName());
+		assertEquals("tcp", coordinator.options().getTransport());
 		assertEquals("node-a", coordinator.options().getNodeId());
 		assertEquals("node-a", coordinator.options().getBootstrapAuthorityId());
 		assertEquals(1, coordinator.options().getTargetVoterCount());
@@ -177,8 +182,9 @@ class LeaderCoordinatorTest {
 		assertTrue(closed.cause().getStackTrace().length > 0);
 	}
 
-	@Test void plaintextSingletonBecomesReadyAndRecoversWithoutCertificatesOrExplicitIdentity() throws Exception {
-		var vertx = runtime(); var config = options("node-a", availablePort(vertx));
+	@ParameterizedTest @ValueSource(strings = {"http", "tcp"})
+	void plaintextSingletonBecomesReadyAndRecoversWithoutCertificatesOrExplicitIdentity(String protocol) throws Exception {
+		var vertx = runtime(); var config = options("node-a", availablePort(vertx)).toBuilder().transport(protocol).build();
 		var first = create(vertx, config, null);
 		await(listen(first)); leader(List.of(first));
 		var identity = first.identity(); var token = await(first.fencingToken());
@@ -189,7 +195,8 @@ class LeaderCoordinatorTest {
 		assertEquals(token.clusterId(), await(restarted.fencingToken()).clusterId());
 	}
 
-	@Test void plaintextNodeOutsideSeedsIsAdmittedAsLearnerWithoutChangingVoters() throws Exception {
+	@ParameterizedTest @ValueSource(strings = {"http", "tcp"})
+	void plaintextNodeOutsideSeedsIsAdmittedAsLearnerWithoutChangingVoters(String protocol) throws Exception {
 		var vertx = runtime(); var endpoints = new JsonArray(); var group = new ArrayList<LeaderCoordinator>();
 		var ports = new ArrayList<Integer>();
 		for (int i = 0; i < 3; i++) {
@@ -197,11 +204,11 @@ class LeaderCoordinatorTest {
 			endpoints.add("127.0.0.1:" + port + "#node-" + (char) ('a' + i));
 		}
 		for (int i = 0; i < 3; i++) group.add(create(vertx,
-			options("node-" + (char) ('a' + i), ports.get(i)).toBuilder().targetVoterCount(3)
+			options("node-" + (char) ('a' + i), ports.get(i)).toBuilder().transport(protocol).targetVoterCount(3)
 				.discovery(DiscoveryOptions.fromJson(new JsonObject().put("type", "static").put("endpoints", endpoints))).build(), null));
 		for (var coordinator : group) await(listen(coordinator));
 		var elected = leader(group);
-		var joining = create(vertx, options("node-d", availablePort(vertx)).toBuilder().targetVoterCount(3)
+		var joining = create(vertx, options("node-d", availablePort(vertx)).toBuilder().transport(protocol).targetVoterCount(3)
 			.discovery(DiscoveryOptions.fromJson(new JsonObject().put("type", "static").put("endpoints", endpoints))).build(), null);
 		await(listen(joining));
 		eventually(vertx, () -> elected.participant().compose(VertxLeaderNode::membership),
@@ -263,8 +270,8 @@ class LeaderCoordinatorTest {
 		try (var retained = FileRaftStore.open(directory.resolve("node-a"), "group", "node-a")) { assertEquals(1, retained.bootstrapState().genesis().targetVoterCount()); }
 	}
 
-	@ParameterizedTest @ValueSource(booleans = {false, true})
-	void staticJsonFormsThreeVotersAndGracefulLeaveKeepsDurableTarget(boolean tls) throws Exception {
+	@ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"http,false", "http,true", "tcp,false", "tcp,true"})
+	void staticJsonFormsThreeVotersAndGracefulLeaveKeepsDurableTarget(String protocol, boolean tls) throws Exception {
 		var runtimes = List.of(runtime(), runtime(), runtime()); var ports = new ArrayList<Integer>();
 		for (var vertx : runtimes) ports.add(availablePort(vertx));
 		var endpoints = new JsonArray();
@@ -272,7 +279,7 @@ class LeaderCoordinatorTest {
 		var group = new ArrayList<LeaderCoordinator>();
 		for (int i = 0; i < 3; i++) {
 			String id = "node-" + (char) ('a' + i);
-			var config = options(id, ports.get(i)).toBuilder().targetVoterCount(3).leaveTimeoutMillis(5000)
+			var config = options(id, ports.get(i)).toBuilder().transport(protocol).targetVoterCount(3).leaveTimeoutMillis(5000)
 				.discovery(DiscoveryOptions.fromJson(new JsonObject().put("type", "static").put("endpoints", endpoints))).build();
 			group.add(create(runtimes.get(i), LeaderOptions.builder(config.toJson()).build(), tls ? id : null));
 		}

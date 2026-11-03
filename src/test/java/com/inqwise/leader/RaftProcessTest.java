@@ -36,7 +36,7 @@ import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 
-/** Actual JVM crashes and OS directory locks, complementing the deterministic simulator and in-process HTTP tests. */
+/** Actual JVM crashes and OS directory locks, complementing the deterministic simulator and in-process transport tests. */
 @Timeout(120)
 class RaftProcessTest {
 	@TempDir Path directory;
@@ -181,11 +181,13 @@ class RaftProcessTest {
 		Path config = directory.resolve("config-" + incarnation + ".json"); Files.writeString(config, options.toJson().encode());
 		var child = new Child(options.toBuilder().build(), "node", config.toString(), String.valueOf(listenerPorts.get(options.getDataDirectory()))); await(child.startup.future()); return child;
 	}
-	List<Child> cluster() throws Exception {
+	List<Child> cluster() throws Exception { return cluster("tcp"); }
+	List<Child> cluster(String protocol) throws Exception {
 		var ports = List.of(port(), port(), port()); var endpoints = new JsonArray();
 		for (int i = 0; i < 3; i++) endpoints.add("127.0.0.1:" + ports.get(i) + "#node-" + (char) ('a' + i));
 		var group = new ArrayList<Child>();
-		for (int i = 0; i < 3; i++) group.add(launch(options("node-" + (char) ('a' + i), ports.get(i), 3, endpoints)));
+		for (int i = 0; i < 3; i++) group.add(launch(options("node-" + (char) ('a' + i), ports.get(i), 3, endpoints)
+			.toBuilder().transport(protocol).build()));
 		leader(group); return group;
 	}
 	Future<List<JsonObject>> states(List<Child> group) {
@@ -262,6 +264,37 @@ class RaftProcessTest {
 			assertTrue(applied(state, "checkpoint-one")); assertTrue(applied(state, "checkpoint-two"));
 			assertEquals(3, state.getInteger("target")); assertEquals(3, voters(state).size()); assertFalse(state.getBoolean("joint"));
 		}
+	}
+
+	@Test void coordinatedHttpToTcpRestartPreservesSnapshotsTailAndMembership() throws Exception {
+		var original = cluster("http"); var formerLeader = leader(original);
+		propose(formerLeader, "before-switch-snapshot"); caughtUp(original, "before-switch-snapshot");
+		for (var child : original) eventually(() -> child.request("compact"), reply -> reply.getBoolean("ok"));
+		var tail = propose(formerLeader, "before-switch-tail"); caughtUp(original, "before-switch-tail");
+		var saved = await(states(original));
+		var stopped = await(Future.all(original.stream().map(child -> child.request("close")).toList()));
+		for (int i = 0; i < original.size(); i++) {
+			assertTrue(((JsonObject) stopped.resultAt(i)).getBoolean("ok")); original.get(i).kill();
+		}
+		// Every HTTP process is stopped before any TCP listener opens; directories and ports are reused.
+		var restarted = new ArrayList<Child>();
+		for (var child : original) restarted.add(launch(child.options.toBuilder().transport("tcp").build()));
+		var successor = leader(restarted); caughtUp(restarted, "before-switch-tail");
+		for (int i = 0; i < restarted.size(); i++) {
+			var recovered = await(restarted.get(i).status()); var before = saved.get(i);
+			assertEquals(before.getString("nodeId"), recovered.getString("nodeId"));
+			assertEquals(before.getString("clusterId"), recovered.getString("clusterId"));
+			assertEquals(before.getString("genesisDigest"), recovered.getString("genesisDigest"));
+			assertEquals(voters(before), voters(recovered)); assertEquals(3, recovered.getInteger("target"));
+			assertEquals(before.getJsonArray("learners"), recovered.getJsonArray("learners"));
+			assertTrue(before.getLong("snapshotIndex") > 0);
+			assertTrue(recovered.getLong("snapshotIndex") >= before.getLong("snapshotIndex"));
+			assertTrue(recovered.getLong("commitIndex") >= before.getLong("commitIndex"));
+			assertTrue(recovered.getLong("term") >= before.getLong("term"));
+			assertTrue(applied(recovered, "before-switch-snapshot"));
+		}
+		var next = propose(successor, "after-tcp-switch"); assertTrue(next.getLong("index") > tail.getLong("index"));
+		caughtUp(restarted, "after-tcp-switch");
 	}
 
 	@Test void nativeOwnershipAndCorruptionFailClosedAcrossJvmBoundaries() throws Exception {

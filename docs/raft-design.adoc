@@ -3,7 +3,7 @@
 Status: implementation proposal, following the project design discussion.
 The foundation types, fixed-membership election/replication core, and Vert.x storage/runtime adapters below
 are implemented in the workspace.
-Authenticated HTTP transport and static/SRV endpoint discovery are also implemented.
+Default TCP and explicitly selectable HTTP transports and static/SRV endpoint discovery are also implemented.
 Durable cluster/genesis binding and authenticated designated-authority bootstrap are implemented.
 Joint voter transitions and learner catch-up are implemented as explicit operations.
 Automatic discovery, leader-authorized learner admission, and delayed voter replacement are implemented.
@@ -66,8 +66,9 @@ The unused blocking `RaftStore` interface has been removed; `AsyncRaftStore` is 
 `LeaderCoordinator` assembles concrete implementations, then retains storage as `AsyncRaftStore` and cluster communication as
 `RaftClusterTransport`. `MembershipController` depends on that cluster transport interface and `NodeDiscovery`; it has no
 HTTP implementation dependency. `VertxLeaderNode` needs only `AsyncRaftStore` and the smaller `RaftTransport` protocol boundary.
-`HttpRaftTransport` implements the cluster contract while its outgoing operations consume `RaftConnection` and incoming
-operations use typed server handlers. Internal helpers with one responsibility do not introduce unused parallel interfaces.
+`HttpRaftTransport` and `TcpRaftTransport` implement the cluster contract through `AbstractRaftClusterTransport`,
+sharing cluster policy while outgoing operations consume `RaftConnection` and incoming operations use typed server handlers.
+See link:raft-tcp.adoc[TCP transport] for framing, lifecycle and deployment details. Internal helpers with one responsibility do not introduce unused parallel interfaces.
 
 `RaftClusterTransport` owns the immutable `BootstrapResult` and `DiscoveryResult` record types. Their inherited source names
 through `HttpRaftTransport` remain usable, but membership policy and new callers can refer directly to the interface types.
@@ -690,7 +691,7 @@ do not affect identity paths. Native Vert.x filesystem operations select a match
 a new named path; corrupt or ambiguous legacy state fails rather than silently creating a new identity. With no configured
 node ID, selection recovers an existing group slot or a single named directory; several candidates require a node ID.
 
-`LeaderCoordinator.create(vertx, options, serverOptions, clientOptions)` accepts validated immutable options and copies HTTP settings,
+`LeaderCoordinator.create(vertx, options, serverOptions, clientOptions)` accepts validated immutable options and copies the selected TCP or HTTP settings,
 returning an unopened coordinator without filesystem or network I/O. Register handlers, then compose `listen()`.
 Startup opens and locks local storage, recovers identity and authority binding, validates TLS credentials and assembles
 transport, discovery and membership before starting participation. Startup failure releases acquired resources.
@@ -698,7 +699,7 @@ Public lifecycle calls enter through owner-context dispatch;
 private start/leave/close operations continue on that owner. Startup invokes initialization directly rather than adding
 another context hop and promise bridge. Synchronous initialization errors follow the same startup cleanup path.
 Listener host/port come from `listen()`, `listen(port)`, or `listen(port, host)`, not LeaderOptions.
-Same-binding calls share startup; conflicting bindings fail. TLS uses standard Vert.x HTTP options.
+Same-binding calls share startup; conflicting bindings fail. TCP is the default; HTTP requires explicit transport selection. TLS uses matching standard Vert.x TCP or HTTP options.
 Startup completion confirms local listener/recovery startup, not voter admission or leader readiness; observe
 `leadershipHandler` for that. `identity()` is available after successful startup and remains available after shutdown;
 calling it before identity recovery throws IllegalStateException. `participant` exposes the admitted runtime for advanced

@@ -33,8 +33,11 @@ public final class RaftProcessNode {
 		try {
 			child.options = LeaderOptions.builder(new JsonObject(java.nio.file.Files.readString(Path.of(args[1])))).build();
 			String id = child.options.getNodeId();
-			child.coordinator = LeaderCoordinator.create(child.vertx, child.options,
-				HttpRaftTransportTest.serverOptions(id), HttpRaftTransportTest.clientOptions(id));
+			child.coordinator = "tcp".equals(child.options.getTransport())
+				? LeaderCoordinator.create(child.vertx, child.options,
+					TcpRaftTransportTest.serverOptions(id), TcpRaftTransportTest.clientOptions(id))
+				: LeaderCoordinator.create(child.vertx, child.options,
+					HttpRaftTransportTest.serverOptions(id), HttpRaftTransportTest.clientOptions(id));
 			child.coordinator.exceptionHandler(cause -> {});
 			await(child.coordinator.snapshotHandlers(point -> Future.succeededFuture(child.applicationData(point.index()).encode()),
 				snapshot -> {

@@ -20,12 +20,7 @@ import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 
 /** Owner-context HTTP framing and exchange lifecycle; typed handlers own protocol and membership policy. */
-final class HttpRaftServer implements Handler<HttpServerRequest> {
-	@FunctionalInterface interface Decoder<T> { T decode(Buffer bytes) throws Exception; }
-	@FunctionalInterface interface Encoder<T> { Buffer encode(T value) throws Exception; }
-	@FunctionalInterface interface RequestHandler<T, R> {
-		void handle(String peer, T message, RaftRequestCompletion<R> completion);
-	}
+final class HttpRaftServer implements Handler<HttpServerRequest>, RaftRpcServer {
 	private record Route<T, R>(Decoder<T> decoder, Encoder<R> encoder, RequestHandler<T, R> handler,
 		ToIntFunction<String> rejection, int failureStatus) {}
 	private final Context context;
@@ -51,12 +46,12 @@ final class HttpRaftServer implements Handler<HttpServerRequest> {
 		server = context.owner().createHttpServer(options).requestHandler(this);
 	}
 
-	<R> void get(String suffix, Encoder<R> encoder, RequestHandler<Void, R> handler,
+	public <R> void get(String suffix, Encoder<R> encoder, RequestHandler<Void, R> handler,
 		ToIntFunction<String> rejection, int failureStatus) {
 		register(gets, suffix, new Route<>(null, encoder, handler, rejection, failureStatus));
 	}
 
-	<T, R> void post(String suffix, Decoder<T> decoder, Encoder<R> encoder, RequestHandler<T, R> handler,
+	public <T, R> void post(String suffix, Decoder<T> decoder, Encoder<R> encoder, RequestHandler<T, R> handler,
 		ToIntFunction<String> rejection, int failureStatus) {
 		register(posts, suffix, new Route<>(decoder, encoder, handler, rejection, failureStatus));
 	}
@@ -66,14 +61,14 @@ final class HttpRaftServer implements Handler<HttpServerRequest> {
 		if (routes.putIfAbsent(basePath + suffix, route) != null) throw new IllegalArgumentException("Duplicate route");
 	}
 
-	Future<Integer> listen() {
+	public Future<Integer> listen() {
 		if (closeResult != null) return Future.failedFuture(new IllegalStateException("Listener closed"));
 		if (listening == null) listening = server.listen().map(HttpServer::actualPort);
 		return listening;
 	}
-	int actualPort() { return server.actualPort(); }
+	public int actualPort() { return server.actualPort(); }
 
-	Future<Void> close() {
+	public Future<Void> close() {
 		if (closeResult == null) {
 			closeResult = ContextDispatch.promise(context);
 			for (var request : List.copyOf(pending)) request.finish(503, null);

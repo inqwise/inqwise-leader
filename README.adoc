@@ -61,7 +61,7 @@ then add the locally installed artifact to your application:
 
 These examples use Java 21+ and Vert.x 5.2. Older published artifacts may not contain the coordinator API.
 The application must provide the Vert.x and logging dependencies declared as `provided` in this project's POM.
-An ordinary `Vertx.vertx()` is sufficient: this API uses direct HTTP between nodes and does not require a Vert.x cluster manager.
+An ordinary `Vertx.vertx()` is sufficient: this API uses direct TCP (default) or explicitly selected HTTP between nodes and does not require a Vert.x cluster manager.
 
 The first example needs no options or certificates. Plaintext trusts self-reported peer identities;
 use it in a trusted development environment. Configuration and authenticated TLS are introduced below.
@@ -279,10 +279,21 @@ node-c.example.net.              60 IN A   192.0.2.12
 ----
 
 The adapter resolves SRV targets to IPv4 addresses, takes the port from each SRV record, then obtains each contacted node's
-persisted identity over HTTP, authenticated by certificates when TLS is enabled. Identity is not encoded as `#node-id` in an SRV target.
+persisted identity over the selected transport, authenticated by certificates when TLS is enabled. Identity is not encoded as `#node-id` in an SRV target.
 SRV priority and weight do not assign voting rights or select the Raft leader.
 SRV replaces the contact source; bootstrap, admission, quorum and automatic replacement behave as in the static examples.
 Removing a DNS record does not immediately remove a voter or reduce quorum. Discovery failures do not authorize a smaller quorum.
+
+=== TCP communication
+
+TCP is the default for all coordinator factories and configurations that omit `transport`.
+For TLS, use the `NetServerOptions`/`NetClientOptions` overload shown below.
+To select HTTP instead, set `options.toBuilder().transport("http").build()` (or `"transport": "http"` in JSON)
+on every peer and use `HttpServerOptions`/`HttpClientOptions` for its TLS configuration.
+
+TCP reuses the binary Raft messages and membership rules, with separate bulk connections for snapshots and larger appends.
+HTTP and TCP listeners do not interoperate; switch all peers during a coordinated maintenance stop while retaining their state.
+See link:docs/raft-tcp.adoc[TCP configuration, wire format and resource bounds] for details and TLS examples.
 
 [[raft-certificates]]
 === 5. Certificates beyond local development
@@ -294,8 +305,8 @@ inside `RaftWorker.start()` with the following code and add these imports:
 [source,java]
 ----
 import io.vertx.core.http.ClientAuth;
-import io.vertx.core.http.HttpClientOptions;
-import io.vertx.core.http.HttpServerOptions;
+import io.vertx.core.net.NetClientOptions;
+import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.PemKeyCertOptions;
 import io.vertx.core.net.PemTrustOptions;
 
@@ -303,16 +314,16 @@ String prefix = ".local/raft-dev/tls/" + options.getNodeId();
 var keys = new PemKeyCertOptions()
     .setKeyPath(prefix + ".key").setCertPath(prefix + ".crt");
 var trust = new PemTrustOptions().addCertPath(".local/raft-dev/tls/ca.crt");
-var serverTls = new HttpServerOptions().setSsl(true).setClientAuth(ClientAuth.REQUIRED)
+var serverTls = new NetServerOptions().setSsl(true).setClientAuth(ClientAuth.REQUIRED)
     .setKeyCertOptions(keys).setTrustOptions(trust);
-var clientTls = new HttpClientOptions().setSsl(true).setVerifyHost(true)
+var clientTls = new NetClientOptions().setSsl(true).setHostnameVerificationAlgorithm("HTTPS")
     .setKeyCertOptions(keys).setTrustOptions(trust);
 
 coordinator = LeaderCoordinator.create(vertx, options, serverTls, clientTls);
 ----
 
 The TLS construction is the same for one node, three voters and a joining learner. Configure every peer for the same mode;
-there is no automatic HTTP/HTTPS fallback. For deployment, replace development file paths and CA with credentials issued for that environment.
+there is no automatic transport or TLS fallback. For deployment, replace development file paths and CA with credentials issued for that environment.
 Each node needs both server and client TLS credentials because it accepts and initiates peer connections.
 
 Every leaf certificate must contain the URI SAN `urn:inqwise:leader:node:<persisted-node-id>` and an IP SAN matching the
@@ -328,8 +339,8 @@ See link:docs/raft-tls.adoc[Certificate setup and deployment differences] for de
 [cols="2,3",options="header"]
 |===
 |Factory |Behavior
-|`create(vertx)` |Local plaintext singleton: group `default`, identity/authority `node-a`, target one, `127.0.0.1:8080`.
-|`create(vertx, options)` |Plaintext with explicit options. The options builder still defaults to three voters.
+|`create(vertx)` |Local plaintext TCP singleton: group `default`, identity/authority `node-a`, target one, `127.0.0.1:8080`.
+|`create(vertx, options)` |Plaintext using TCP by default, or the explicitly selected transport. The options builder still defaults to three voters.
 |`create(vertx, options, serverOptions, clientOptions)` |Uses the supplied Vert.x HTTP options. Enable TLS on both sides for verified mutual TLS.
 |===
 

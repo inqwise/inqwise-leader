@@ -2,7 +2,9 @@
 
 `LeaderCoordinator.create(vertx)` and `create(vertx, options)` use plaintext without certificates.
 Plaintext retains protocol identity checks but accepts self-reported node IDs; it does not authenticate peers.
-To enable mutual TLS, use the four-argument factory and set SSL on both HTTP server and client options.
+To enable mutual TLS, use the four-argument factory and set SSL on both TCP server and client options (`NetServerOptions`/`NetClientOptions`).
+TCP clients require `setHostnameVerificationAlgorithm("HTTPS")`. Explicit `transport("http")` configurations
+instead use `HttpServerOptions`/`HttpClientOptions` with `setVerifyHost(true)`.
 Both sides must provide a private key, leaf certificate and trusted CA.
 The leaf certificate's URI SAN binds the connection to the node's persisted identity;
 its IP SAN authenticates the IPv4 endpoint contacted by peers.

@@ -13,7 +13,7 @@ import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpConnection;
 import io.vertx.core.net.KeyCertOptions;
 
-/** Certificate identity convention for the HTTP transport. */
+/** Certificate identity convention shared by node transports. */
 public final class RaftTlsIdentity {
 	/** URI subject-alternative-name prefix for a persisted node ID. */
 	public static final String NODE_URI_PREFIX = "urn:inqwise:leader:node:";
@@ -70,12 +70,22 @@ public final class RaftTlsIdentity {
 	static String verify(HttpConnection connection, String localNodeId,
 		Function<X509Certificate, String> certificateIdentity) throws Exception {
 		if (!connection.isSsl()) throw new IOException("TLS required");
-		var local = connection.sslSession().getLocalCertificates();
+		return verify(connection.sslSession(), connection.peerCertificates(), localNodeId, certificateIdentity);
+	}
+
+	static String verify(io.vertx.core.net.NetSocket connection, String localNodeId,
+		Function<X509Certificate, String> certificateIdentity) throws Exception {
+		if (!connection.isSsl()) throw new IOException("TLS required");
+		return verify(connection.sslSession(), connection.peerCertificates(), localNodeId, certificateIdentity);
+	}
+
+	private static String verify(javax.net.ssl.SSLSession session, List<java.security.cert.Certificate> certificates,
+		String localNodeId, Function<X509Certificate, String> certificateIdentity) throws IOException {
+		var local = session.getLocalCertificates();
 		if (local == null || local.length == 0
 			|| !localNodeId.equals(certificateIdentity.apply((X509Certificate) local[0]))) {
 			throw new IOException("Local certificate and persisted identity disagree");
 		}
-		var certificates = connection.peerCertificates();
 		if (certificates == null || certificates.isEmpty()) throw new IOException("Peer certificate required");
 		String id = certificateIdentity.apply((X509Certificate) certificates.getFirst());
 		RaftIdentity.validateNodeId(id);

@@ -2,7 +2,7 @@ package com.inqwise.leader;
 
 import io.vertx.core.Completable;
 
-/** Owner-context peer operations. Completion of send/install confirms HTTP acceptance, not a Raft acknowledgement. */
+/** Owner-context peer operations. Completion of send/install confirms transport acceptance, not a Raft acknowledgement. */
 interface RaftConnection {
 	void identify(Completable<RaftWireCodec.PeerIdentity> completion);
 	void membership(Completable<MemberStatus> completion);
