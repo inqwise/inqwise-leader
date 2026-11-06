@@ -55,12 +55,17 @@ class MembershipControllerTest {
 		return local(id, pool, source, stage -> Future.succeededFuture());
 	}
 	Local local(String id, int pool, NodeDiscovery source, VertxRaftStore.WriteObserver observer) throws Exception {
+		return local(id, pool, source, observer, null);
+	}
+	Local local(String id, int pool, NodeDiscovery source, VertxRaftStore.WriteObserver observer,
+		NodeEndpoint advertised) throws Exception {
 		var vertx = Vertx.vertx();
 		var store = new VertxRaftStore(vertx.getOrCreateContext(), directory.resolve(id), "group", id, 5000, observer);
 		var http = await(HttpRaftTransport.forBootstrap(new RaftBootstrap(store, "node-a"), serverOptions(id), clientOptions(id)));
 		int port = await(http.listen());
 		var controller = new MembershipController(store, http, source,
-			new MembershipController.Options(50, 900, pool, null), new RaftElection.Timing(550, 1000, 80), new Random(locals.size() + 7));
+			new MembershipController.Options(50, 900, pool, advertised),
+			new RaftElection.Timing(550, 1000, 80), new Random(locals.size() + 7));
 		controller.exceptionHandler(cause -> {
 			errors.computeIfAbsent(id, ignored -> new java.util.concurrent.ConcurrentLinkedQueue<>()).add(String.valueOf(cause.getMessage()));
 			if (Vertx.currentContext() != store.context()) callbackFailure.compareAndSet(null, new AssertionError("error context"));
@@ -413,6 +418,73 @@ class MembershipControllerTest {
 			assertNotNull(retained.bootstrapState().genesis()); assertEquals("node-a", retained.identity().nodeId());
 			assertEquals(0, retained.persistentState().commitIndex());
 		}
+	}
+
+	@Test void advertisedIdentityMismatchFailsStartupAndReleasesDurableStore() throws Exception {
+		var a = local("node-a", 2, discovery(), stage -> Future.succeededFuture(),
+			new NodeEndpoint("127.0.0.1", 8080, "node-b"));
+		var started = a.controller().start(); assertThrows(Exception.class, () -> await(started));
+		assertInstanceOf(IllegalStateException.class, started.cause());
+		assertTrue(started.cause().getMessage().contains("Advertised identity"));
+		await(a.controller().close());
+		assertThrows(Exception.class, () -> await(a.controller().start()));
+		try (var recovered = FileRaftStore.open(directory.resolve("node-a"), "group", "node-a")) {
+			assertEquals("node-a", recovered.identity().nodeId());
+			assertEquals(RaftBootstrapState.UNASSIGNED, recovered.bootstrapState());
+		}
+	}
+
+	@Test void synchronousNullAndPartialDiscoveryFailuresAreReportedAndResolutionContinues() throws Exception {
+		var calls = new AtomicInteger();
+		NodeDiscovery source = () -> switch (calls.getAndIncrement()) {
+			case 0 -> throw new IllegalStateException("Resolver threw before returning");
+			case 1 -> null;
+			case 2 -> Future.succeededFuture(new NodeDiscovery.Result(List.of(), Map.of("node-b", "NXDOMAIN"), 1));
+			default -> Future.succeededFuture(new NodeDiscovery.Result(endpoints.get(), Map.of(), 50));
+		};
+		var a = local("node-a", 2, source); await(a.controller().start());
+		eventually(a.vertx(), () -> Future.succeededFuture(calls.get()), count -> count >= 4);
+		var reported = errors.get("node-a"); assertNotNull(reported);
+		assertTrue(reported.stream().anyMatch(message -> message.contains("Resolver threw before returning")));
+		assertTrue(reported.stream().anyMatch(message -> message.contains("discovery future")));
+		assertTrue(reported.stream().anyMatch(message -> message.contains("NXDOMAIN")));
+		assertEquals(RaftBootstrapState.UNASSIGNED, await(a.store().bootstrapState()));
+		var b = local("node-b", 2); var c = local("node-c", 2);
+		await(b.controller().start()); await(c.controller().start());
+		var current = leader(List.of(a, b, c));
+		assertEquals(Set.of("node-a", "node-b", "node-c"), await(view(current)).membership().committed().voters());
+	}
+
+	@Test void failedStandbyIsEvictedWithoutChangingHealthyVotersAndMayRejoin() throws Exception {
+		var original = cluster(2); var standby = local("node-d", 2); standby(standby, original);
+		var genesis = await(standby.store().bootstrapState()).genesis();
+		await(standby.controller().close());
+		eventually(original.getFirst().vertx(), () -> Future.all(original.stream().map(this::view).toList())
+			.map(results -> results.list().stream().map(MembershipView.class::cast).anyMatch(value ->
+				value.leadership().leader() && !value.membership().effective().members().contains("node-d")
+					&& !value.membership().committed().members().contains("node-d"))), Boolean::booleanValue);
+		var stable = await(view(leader(original))).membership().committed();
+		assertEquals(Set.of("node-a", "node-b", "node-c"), stable.voters()); assertFalse(stable.joint());
+		var returned = local("node-d", 2); standby(returned, original);
+		assertEquals(genesis, await(returned.store().bootstrapState()).genesis());
+		assertEquals(stable.voters(), await(view(leader(original))).membership().committed().voters());
+	}
+
+	@Test void foreignClusterAdmissionCannotConsumeLearnerSlotAndValidRetrySucceeds() throws Exception {
+		var original = cluster(1); var current = leader(original); var d = local("node-d", 1);
+		long term = await(view(current)).leadership().term();
+		var client = d.vertx().createHttpClient(clientOptions("node-d"));
+		try {
+			var post = await(client.request(new RequestOptions().setSsl(true).setHost(current.endpoint().host())
+				.setPort(current.endpoint().port()).setMethod(HttpMethod.POST).setURI("/leader/v1/groups/group/join")));
+			var request = new JoinRequest(new RaftIdentity("node-d", "group"), "foreign-cluster", d.endpoint(), term);
+			assertEquals(409, await(post.putHeader("Content-Type", RaftWireCodec.CONTENT_TYPE)
+				.send(RaftWireCodec.join(request))).statusCode());
+		} finally { await(client.close()); }
+		assertTrue(await(view(current)).membership().effective().learners().isEmpty());
+		assertEquals(RaftBootstrapState.UNASSIGNED, await(d.store().bootstrapState()));
+		standby(d, original);
+		assertEquals(Set.of("node-d"), await(view(leader(original))).membership().committed().learners());
 	}
 
 }
