@@ -971,7 +971,10 @@ public final class RaftElection {
 
 	private void sendAppend(String voter, boolean retry) {
 		InstallSnapshot snapshotRequest = snapshotInFlight.get(voter);
-		if (snapshotRequest != null) { if (retry) send(voter, snapshotRequest); return; }
+		if (snapshotRequest != null) {
+			if (retry) send(voter, snapshotRequest);
+			return;
+		}
 		if (nextIndex.get(voter) <= baseIndex()) {
 			inFlight.remove(voter);
 			var transfer = new InstallSnapshot(hardState.currentTerm(), ++sequence, durableCheckpoint);

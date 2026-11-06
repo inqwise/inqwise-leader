@@ -262,7 +262,10 @@ class LeaderCoordinatorTest {
 		await(listen(coordinator)); await(listen(coordinator)); assertTrue(ready.await(5, TimeUnit.SECONDS));
 		assertEquals(new NodeEndpoint("127.0.0.1", port, "node-a"), await(coordinator.localEndpoint()));
 		var started = listen(coordinator); await(started); var late = new CountDownLatch(1);
-		started.onComplete(value -> { if (Vertx.currentContext() != coordinator.context()) failed.set(new AssertionError("future context")); late.countDown(); });
+		started.onComplete(value -> {
+			if (Vertx.currentContext() != coordinator.context()) failed.set(new AssertionError("future context"));
+			late.countDown();
+		});
 		assertTrue(late.await(5, TimeUnit.SECONDS)); assertNull(failed.get());
 		await(coordinator.close()); await(coordinator.close()); assertFalse(await(coordinator.leadership()).leader());
 		assertThrows(Exception.class, () -> await(listen(coordinator)));
@@ -283,7 +286,8 @@ class LeaderCoordinatorTest {
 				.discovery(DiscoveryOptions.fromJson(new JsonObject().put("type", "static").put("endpoints", endpoints))).build();
 			group.add(create(runtimes.get(i), LeaderOptions.builder(config.toJson()).build(), tls ? id : null));
 		}
-		for (var coordinator : group) await(listen(coordinator)); var elected = leader(group);
+		for (var coordinator : group) await(listen(coordinator));
+		var elected = leader(group);
 		var committed = await(elected.participant().compose(VertxLeaderNode::membership));
 		assertEquals(Set.of("node-a", "node-b", "node-c"), committed.committed().voters());
 		var departing = group.stream().filter(node -> node != elected).findFirst().orElseThrow();

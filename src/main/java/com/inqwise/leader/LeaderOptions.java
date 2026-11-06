@@ -267,7 +267,12 @@ public final class LeaderOptions {
 			json.put(key, Objects.requireNonNull(value, key)); return this;
 		}
 		private Builder optional(String key, String value) {
-			if (value == null) json.remove(key); else json.put(key, value); return this;
+			if (value == null) {
+				json.remove(key);
+			} else {
+				json.put(key, value);
+			}
+			return this;
 		}
 	}
 }

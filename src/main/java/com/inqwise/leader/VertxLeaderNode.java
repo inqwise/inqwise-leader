@@ -557,7 +557,8 @@ public final class VertxLeaderNode {
 					&& configuration.voters().contains(identity.nodeId()) && configuration.hasQuorum(fresh);
 			}
 		}
-		if (membershipChange != null && (status != Status.RUNNING || engine.snapshot().role() != RaftElection.Role.LEADER
+		if (membershipChange != null && (engine == null || status != Status.RUNNING
+			|| engine.snapshot().role() != RaftElection.Role.LEADER
 			|| engine.snapshot().hardState().currentTerm() != membershipTerm)) {
 			membershipChange.tryFail(new IllegalStateException("Membership outcome may be unknown after leadership loss"));
 			membershipChange = null; expectedMembership = null;
@@ -623,13 +624,18 @@ public final class VertxLeaderNode {
 		if (compaction != null) return Future.failedFuture(new RaftUnavailableException("A checkpoint is already in progress"));
 		if (engine.snapshot().persistencePending()) return Future.failedFuture(new RaftUnavailableException("Wait for the pending durable write"));
 		var point = engine.snapshotPoint();
-		if (point.containsData() && snapshotProvider == null) return Future.failedFuture(new IllegalStateException("DATA requires application snapshot hooks"));
 		compaction = ContextDispatch.promise(context);
 		var pending = compaction;
 		var result = pending.future();
 		try {
-			Future<String> data = point.containsData() ? Objects.requireNonNull(snapshotProvider.apply(point), "snapshot future")
-				: Future.succeededFuture(point.previousData());
+			Future<String> data;
+			if (point.containsData()) {
+				var provider = snapshotProvider;
+				if (provider == null) throw new IllegalStateException("DATA requires application snapshot hooks");
+				data = Objects.requireNonNull(provider.apply(point), "snapshot future");
+			} else {
+				data = Future.succeededFuture(point.previousData());
+			}
 			ContextDispatch.relay(context, data).onComplete(outcome -> {
 				if (status != Status.RUNNING || compaction != pending) return;
 				try {

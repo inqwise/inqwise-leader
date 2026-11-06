@@ -73,9 +73,9 @@ public sealed interface DiscoveryOptions permits DiscoveryOptions.Static, Discov
 		/**
 		 * @param endpoints contacts, copied and deduplicated; at most 64 before deduplication
 		 */
-		public Static {
+		public Static(List<NodeEndpoint> endpoints) {
 			if (endpoints.size() > 64) throw new IllegalArgumentException("At most 64 static endpoints are supported");
-			endpoints = List.copyOf(endpoints).stream().distinct().toList();
+			this.endpoints = List.copyOf(endpoints).stream().distinct().toList();
 		}
 		@Override public JsonObject toJson() {
 			var values = new JsonArray();

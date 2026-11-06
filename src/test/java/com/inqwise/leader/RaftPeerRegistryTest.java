@@ -20,6 +20,22 @@ class RaftPeerRegistryTest {
 		return new DiscoveredPeer(new RaftIdentity(id, "group"), "cluster", endpoint(id, port));
 	}
 
+	@Test void discoveryResultIsIndependentOfMutableInputsAndRejectsOutputMutation() {
+		var discovered = peer("node-b", 8081); var failed = endpoint("node-c", 8082);
+		var peers = new java.util.ArrayList<>(List.of(discovered));
+		var failures = new HashMap<>(Map.of(failed, "Unavailable"));
+		var conflicts = new java.util.HashSet<>(Set.of("foreign-cluster"));
+		var result = new RaftClusterTransport.DiscoveryResult(peers, failures, conflicts);
+		peers.clear(); failures.clear(); conflicts.clear();
+		assertEquals(List.of(discovered), result.peers());
+		assertEquals(Map.of(failed, "Unavailable"), result.failures());
+		assertEquals(Set.of("foreign-cluster"), result.conflicts());
+		assertThrows(UnsupportedOperationException.class, () -> result.peers().clear());
+		assertThrows(UnsupportedOperationException.class, () -> result.failures().clear());
+		assertThrows(UnsupportedOperationException.class, () -> result.conflicts().clear());
+		assertTrue(new RaftClusterTransport.DiscoveryResult(peers, failures).conflicts().isEmpty());
+	}
+
 	@Test void duplicateClaimsAreQuarantinedAndOnlyUnambiguousDiscoveryClearsThem() {
 		var registry = new RaftPeerRegistry("node-a", 4);
 		var first = endpoint("node-b", 8081); var second = endpoint("node-b", 8082);

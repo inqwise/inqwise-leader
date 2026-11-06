@@ -53,7 +53,8 @@ public final class RaftTlsIdentity {
 			var aliases = new HashSet<String>();
 			for (String type : List.of("RSA", "EC", "EdDSA", "Ed25519", "Ed448", "RSASSA-PSS", "DSA")) {
 				var server = x509.getServerAliases(type, null); var client = x509.getClientAliases(type, null);
-				if (server != null) aliases.addAll(List.of(server)); if (client != null) aliases.addAll(List.of(client));
+				if (server != null) aliases.addAll(List.of(server));
+				if (client != null) aliases.addAll(List.of(client));
 			}
 			for (String alias : aliases) {
 				var chain = x509.getCertificateChain(alias);

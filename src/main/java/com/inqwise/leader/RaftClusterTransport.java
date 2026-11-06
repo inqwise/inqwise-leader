@@ -154,8 +154,10 @@ public interface RaftClusterTransport extends RaftTransport {
 		 * @param failures failed contacts
 		 * @param conflicts incompatible assigned cluster IDs
 		 */
-		public DiscoveryResult {
-			peers = List.copyOf(peers); failures = Map.copyOf(failures); conflicts = Set.copyOf(conflicts);
+		public DiscoveryResult(List<DiscoveredPeer> peers, Map<NodeEndpoint, String> failures, Set<String> conflicts) {
+			this.peers = List.copyOf(peers);
+			this.failures = Map.copyOf(failures);
+			this.conflicts = Set.copyOf(conflicts);
 		}
 	}
 }

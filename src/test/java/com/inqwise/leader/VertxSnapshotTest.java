@@ -104,7 +104,11 @@ class VertxSnapshotTest {
 	@Test void dataWithoutHooksCannotBeCompactedAndProviderFailurePreservesLog() throws Exception {
 		var node = node(SINGLE, envelope -> Future.succeededFuture()); await(node.start());
 		eventually(node::leadership, Leadership::leader); var entry = await(node.propose("retained"));
-		assertThrows(Exception.class, () -> await(node.compact()));
+		var rejected = node.compact(); assertThrows(Exception.class, () -> await(rejected));
+		assertInstanceOf(IllegalStateException.class, rejected.cause());
+		assertEquals("DATA requires application snapshot hooks", rejected.cause().getMessage());
+		var retry = node.compact(); assertThrows(Exception.class, () -> await(retry));
+		assertEquals(rejected.cause().getMessage(), retry.cause().getMessage(), "Missing hooks must not retain compaction state");
 		assertNull(await(node.replication()).durableState().snapshot()); await(node.close());
 		var restarted = node(SINGLE, envelope -> Future.succeededFuture());
 		await(restarted.snapshotHandlers(point -> Future.failedFuture("provider failed"), checkpoint -> Future.succeededFuture()));

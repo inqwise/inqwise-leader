@@ -192,7 +192,9 @@ class RaftProcessTest {
 	}
 	Future<List<JsonObject>> states(List<Child> group) {
 		return Future.all(group.stream().map(Child::status).toList()).map(values -> {
-			var states = new ArrayList<JsonObject>(); for (int i = 0; i < group.size(); i++) states.add(values.resultAt(i)); return states;
+			var states = new ArrayList<JsonObject>();
+			for (int i = 0; i < group.size(); i++) states.add(values.resultAt(i));
+			return states;
 		});
 	}
 	Child leader(List<Child> group) throws Exception {
