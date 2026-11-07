@@ -12,7 +12,7 @@ Graceful network leave with bounded removal confirmation is implemented.
 High-level JSON/builder configuration and the owning LeaderCoordinator facade are implemented.
 Ready leadership fencing tokens and a compiled destination example with delayed-write tests are implemented.
 The milestones below document the implemented Raft APIs and HTTP wire contract. These workspace APIs are not released yet.
-The current `LeaderConsensus` uses clustered event-bus messages and shared locks.
+The separate `LeaderConsensus` now uses storage-free cluster shared-map election; see link:cluster-election.adoc[its protocol and limits].
 
 == Vert.x-first implementation principle
 
@@ -73,7 +73,7 @@ See link:raft-tcp.adoc[TCP transport] for framing, lifecycle and deployment deta
 `RaftClusterTransport` owns the immutable `BootstrapResult` and `DiscoveryResult` record types. Their inherited source names
 through `HttpRaftTransport` remain usable, but membership policy and new callers can refer directly to the interface types.
 This workspace refactor changes Java implementation/type ownership; it does not change HTTP wire version, durable format,
-bootstrap rules or quorum calculations. Legacy LeaderConsensus and LeaderConsensusOptions remain unchanged.
+bootstrap rules or quorum calculations. LeaderConsensus and LeaderConsensusOptions keep their public API; their separate cluster election protocol is documented independently.
 
 `RaftPeerRegistry` owns bounded verified endpoints, verification times, identity quarantine and discovery generations.
 A pass aggregates typed contact completions directly instead of retaining per-peer Future chains and joining their results.

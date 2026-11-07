@@ -14,7 +14,7 @@ Leader coordination for Vert.x applications
 
 == Purpose
 
-Inqwise-Leader provides the existing `LeaderConsensus` API and an opt-in `LeaderCoordinator` runtime using Raft.
+Inqwise-Leader provides storage-free cluster election through `LeaderConsensus` and an opt-in durable `LeaderCoordinator` runtime using Raft.
 The coordinator persists consensus state, manages voting membership and reports when the local node is ready for leader work.
 Exclusive external side effects require the destination to enforce fencing; leadership alone does not cancel work already in flight.
 
@@ -33,7 +33,7 @@ The workspace `LeaderCoordinator` runtime follows the https://raft.github.io/[Ra
 . Local readiness requires a durable current-term commit and recent quorum responses.
 . Applications start and stop leader work through readiness handlers, and fence external mutations at their destinations.
 
-The library does not automatically replicate application jobs. The legacy API is documented separately below.
+The library does not automatically replicate application jobs. Storage-free `LeaderConsensus` is documented separately below.
 
 == Key Features
 
@@ -439,7 +439,7 @@ It checks leader failover, minority write rejection, full-cluster snapshot recov
 cross-process ownership, corruption rejection and forced termination at compaction write boundaries.
 These tests also run in the full Maven suite; JVM termination does not simulate machine power loss.
 
-== Legacy LeaderConsensus quick start
+== Storage-free LeaderConsensus quick start
 
 This example uses the existing `LeaderConsensus` API. For the opt-in `LeaderCoordinator` API and its
 single-node, multi-node, discovery and certificate examples, see <<raft-quick-start>>.
@@ -497,7 +497,16 @@ For election across processes, deploy this verticle on each node using a cluster
 Use the same group name (`scheduled-job`) on every participating node.
 Your application must supply Vert.x and a Log4j runtime; this library declares those runtime dependencies as provided.
 
-The default election timeout is 2500 ms and the leader heartbeat interval is 1000 ms.
+No independent storage or persistent volume is required. A shared-map ownership record is supplied by the configured cluster manager.
+Each start uses a fresh incarnation; a complete cluster shutdown can discard all election state.
+This is cluster-scoped election, not durable Raft. Partition safety depends on the cluster manager's conditional-map and partition guarantees.
+
+The default pending timeout is 2500 ms and the heartbeat interval is 1000 ms.
+Readiness and takeover use at least three heartbeat intervals, making the default timeout 3000 ms.
+Approval/refusal getters now count conditional ownership writes, rather than peer acknowledgments.
+See link:docs/cluster-election.adoc[Cluster election] for renewal, failure handling, timing and safety limits.
+Optional real-cluster validation is available with `mvn -Pcluster-tests verify`; Hazelcast is used only by that test profile.
+Do not roll this protocol together with the older lock/message implementation; stop the old group and its work before migration.
 Register the leadership callback before calling `start()` and call `stop()` when the verticle is undeployed.
 Keep callback and timer handlers nonblocking. Canceling the timer prevents future job runs; it does not cancel a job already in progress.
 

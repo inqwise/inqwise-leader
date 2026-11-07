@@ -1,7 +1,7 @@
 = Raft Deployment and Recovery
 
 This guide covers the opt-in `LeaderCoordinator` workspace API.
-The API is unreleased; the existing `LeaderConsensus` API uses a separate protocol and storage model.
+The API is unreleased; the existing `LeaderConsensus` API uses separate storage-free shared-map election (see link:cluster-election.adoc[cluster election]).
 See link:../README.adoc#raft-quick-start[the coordinator quick start] for Java assembly and
 link:raft-design.adoc[the design] for protocol contracts and test evidence.
 
