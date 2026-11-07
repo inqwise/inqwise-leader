@@ -133,4 +133,74 @@ class RaftWireCodecTest {
 		assertThrows(IOException.class, () -> RaftWireCodec.identity(RaftWireCodec.identity(identity, "cluster").setInt(4, 3)));
 	}
 
+	@Test void unknownMessageTypesInvalidTermsAndNoncanonicalBooleansAreRejected() throws Exception {
+		var vote = RaftWireCodec.encode(new RaftElection.Envelope("group", "cluster", "node-a", "node-b",
+			new RaftElection.VoteRequest(1, new RaftElection.LogPosition(0, 0))));
+		var unknown = vote.copy().setByte(vote.length() - 25, (byte) 99);
+		assertEquals("Unknown protocol message", assertThrows(IOException.class,
+			() -> RaftWireCodec.decode(unknown)).getMessage());
+		var invalidTerm = vote.copy().setLong(vote.length() - 24, -1);
+		assertInstanceOf(IllegalArgumentException.class,
+			assertThrows(IOException.class, () -> RaftWireCodec.decode(invalidTerm)).getCause());
+		var response = RaftWireCodec.encode(new RaftElection.Envelope("group", "cluster", "node-a", "node-b",
+			new RaftElection.VoteResponse(1, 1, false)));
+		response.setByte(response.length() - 1, (byte) 2);
+		assertEquals("Invalid boolean", assertThrows(IOException.class,
+			() -> RaftWireCodec.decode(response)).getMessage());
+	}
+
+	@Test void appendRejectsInvalidBatchCountsAndUnknownEntryKindsBeforeDispatch() throws Exception {
+		var empty = RaftWireCodec.encode(new RaftElection.Envelope("group", "cluster", "node-a", "node-b",
+			new RaftElection.AppendEntries(1, 1, new RaftElection.LogPosition(0, 0), List.of(), 0)));
+		for (int count : List.of(-1, RaftElection.MAX_APPEND_ENTRIES + 1)) {
+			var invalid = empty.copy().setInt(empty.length() - 4, count);
+			assertEquals("Invalid batch size", assertThrows(IOException.class,
+				() -> RaftWireCodec.decode(invalid)).getMessage());
+		}
+		var entry = RaftWireCodec.encode(new RaftElection.Envelope("group", "cluster", "node-a", "node-b",
+			new RaftElection.AppendEntries(1, 1, new RaftElection.LogPosition(0, 0),
+				List.of(new RaftLogEntry(1, 1, RaftLogEntry.Kind.NO_OP, "")), 0)));
+		entry.setByte(entry.length() - 5, (byte) 255);
+		assertEquals("Unknown entry kind", assertThrows(IOException.class,
+			() -> RaftWireCodec.decode(entry)).getMessage());
+	}
+
+	@Test void identityRejectsInvalidClaimsTrailingDataAndUnencodableStrings() throws Exception {
+		var identity = new RaftIdentity("node-a", "group");
+		var valid = RaftWireCodec.identity(identity, "cluster");
+		assertThrows(IOException.class, () -> RaftWireCodec.identity(valid.copy().setByte(12, (byte) '#')));
+		assertThrows(IOException.class, () -> RaftWireCodec.identity(valid.copy().appendByte((byte) 0)));
+		assertThrows(IOException.class, () -> RaftWireCodec.identity(RaftWireCodec.identity(identity, " ")));
+		assertThrows(IOException.class, () -> RaftWireCodec.identity(identity, "x".repeat(4097)));
+		assertThrows(java.nio.charset.CharacterCodingException.class,
+			() -> RaftWireCodec.identity(identity, "\ud800"));
+		var fixed = RaftGenesis.create("cluster", "group", null, java.util.Set.of("node-a"), 1);
+		assertThrows(IOException.class, () -> RaftWireCodec.genesis(RaftWireCodec.genesis(fixed)));
+		assertEquals("node-a", RaftWireCodec.identity(valid).nodeId());
+	}
+
+	@Test void malformedMembershipJoinAndLeaveEvidenceReturnsCheckedProtocolFailures() throws Exception {
+		var identity = new RaftIdentity("node-a", "group");
+		var genesis = RaftGenesis.create("cluster", "group", "node-a", java.util.Set.of("node-a"), 1);
+		var configuration = RaftConfiguration.stable(java.util.Set.of("node-a"), java.util.Set.of());
+		var status = RaftWireCodec.status(new MemberStatus(identity, genesis, 1, "node-a", true, configuration));
+		// The responding identity must agree with the ready leader claim.
+		status.setByte(17, (byte) 'b');
+		assertInstanceOf(IllegalArgumentException.class,
+			assertThrows(IOException.class, () -> RaftWireCodec.status(status)).getCause());
+		var join = RaftWireCodec.join(new JoinRequest(new RaftIdentity("node-b", "group"), null,
+			new NodeEndpoint("127.0.0.1", 8080, "node-b"), 1));
+		join.setInt(join.length() - 12, 0);
+		assertInstanceOf(IllegalArgumentException.class,
+			assertThrows(IOException.class, () -> RaftWireCodec.join(join)).getCause());
+		var leave = RaftWireCodec.leave(new LeaveRequest(identity, "cluster", 1));
+		leave.setLong(leave.length() - 8, 0);
+		assertInstanceOf(IllegalArgumentException.class,
+			assertThrows(IOException.class, () -> RaftWireCodec.leave(leave)).getCause());
+		var receipt = RaftWireCodec.left(new LeaveResult(identity, "cluster", 1, "node-b", configuration, 10, 11));
+		receipt.setLong(receipt.length() - 8, 9);
+		assertInstanceOf(IllegalArgumentException.class,
+			assertThrows(IOException.class, () -> RaftWireCodec.left(receipt)).getCause());
+	}
+
 }
