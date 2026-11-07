@@ -1,0 +1,140 @@
+= Storage-free cluster election
+
+`LeaderConsensus` keeps its existing public constructors, options and methods, with no extra required configuration.
+It uses the already configured Vert.x cluster manager through `SharedData.getAsyncMap`; it has no provider-specific dependency,
+local data directory, independent storage service, voter list or Raft bootstrap authority.
+On an ordinary `Vertx.vertx()` instance, the same mechanism coordinates instances inside that Vert.x instance only.
+Different nonclustered Vert.x instances do not coordinate with each other.
+
+This API is cluster-scoped election, not durable Raft. The separate `LeaderCoordinator` runtime still provides durable Raft.
+
+== Ownership and renewal
+
+A reserved shared map, `com.inqwise.leader.cluster-election.v1`, holds one record per group name.
+Each `start()` creates a fresh random incarnation, including when the same object or protected diagnostic ID is reused.
+Records contain the incarnation, diagnostic owner ID, a fresh heartbeat token and the owner's readiness timeout.
+No identity has to survive redeployment, and no cluster-manager internal accessor is needed.
+The shared map itself supplies group-wide arbitration; membership discovery is not used to calculate a voting majority.
+
+At startup a contender observes the group record. It waits for that exact value to remain unchanged for a timeout,
+then conditionally creates an absent record or replaces the observed record. Contenders also wait when the record is empty;
+absence is not evidence that an earlier owner has already stopped application work.
+Only a successful conditional write can enable local readiness. A refusal causes another observation cycle.
+An unreadable record fails closed instead of being overwritten.
+
+The owner periodically replaces its exact record with a fresh heartbeat token. A contender cannot replace a heartbeat that
+changed after its read. Each instance permits only one read/write sequence at a time.
+A contender honors at least the timeout carried in the observed record, even when its own options request faster failure detection.
+
+The heartbeat interval uses `LeaderConsensusOptions.getValidateLeadingTimer()` (default 1000 ms).
+The local readiness timeout is the greater of `getPingLeadingTimer()` (default 2500 ms) and three heartbeat intervals.
+With defaults this is 3000 ms; initial acquisition and takeover normally take that observation period plus map latency and timer scheduling.
+The timeout floor also supports existing configurations whose pending timeout is shorter than their heartbeat interval.
+
+A successful renewal establishes readiness only until its dispatch time plus the local timeout.
+A delayed response cannot extend that deadline from its eventual delivery time.
+`getIsLeader()` checks elapsed monotonic time, even before a delayed timer can issue the demotion callback.
+A failed provider operation or an observed loss of ownership demotes immediately on the owner context.
+A stalled operation cannot keep local readiness true indefinitely; provider recovery can allow a subsequent conditional renewal.
+
+`stop()` invalidates the public readiness observation immediately and schedules cleanup on the owning context.
+Cleanup conditionally removes only the exact record held by that run. Late successful claims are cleaned up by exact comparison,
+so an old completion or cleanup cannot overwrite or remove a restarted instance's newer claim.
+If cleanup fails, another contender can take over after the last record stops changing.
+
+== Public API and callbacks
+
+`start()` and `stop()` are idempotent. Protocol state and callbacks run on the event-loop context captured at construction.
+Calls from other threads atomically update lifecycle intent; queued starts, stops and completions cannot cancel a newer run
+or leave an obsolete run's periodic timer alive. Map operations and timer cleanup remain serialized on the owning context.
+Construct the object in the application's owning verticle when those callbacks must share its context.
+Register handlers before starting. All registered handlers receive transitions; registering a handler does not replay the current state.
+A failing positive subscriber stops that run and notifies demotion. Exceptions from demotion subscribers are logged without suppressing
+remaining subscribers. Stopping inside a positive callback aborts that run's subsequent leader announcement.
+
+Leader announcements still publish a JSON object to the group-name event-bus address using the existing
+`ADDRESS_UUID` and `IS_LEADER` keys. These are observations, not authority: event-bus claims or acknowledgments cannot grant or revoke ownership.
+The existing `Keys` constants, including the historical `IS_ACKNOLEDGE` spelling, remain source/binary compatible.
+
+`getApprovalCounter()` now reports successful conditional ownership writes in the current run.
+`getRefusalCounter()` reports refused conditional ownership writes in that run.
+Both saturate at the largest integer and reset on start/stop. They are diagnostics, not peer counts or Raft votes.
+The public method signatures are unchanged; the internal protocol and these diagnostic semantics have changed.
+
+== Deployment and safety boundaries
+
+The provider must serialize competing conditional map operations and make successful writes visible to other contenders.
+Replication, operation availability and network partition behavior come from the configured cluster manager.
+A generic Vert.x shared map is not a promise of quorum-based consistency during a partition.
+Choose the cluster manager's partition policy accordingly; this library cannot strengthen an eventually consistent map into consensus.
+The dependency remains provider-independent, but provider configurations are not interchangeable safety guarantees.
+
+Readiness also relies on local monotonic elapsed time and appropriate timeout margins for the runtime.
+It cannot cancel work already in flight, prevent a paused job from resuming, or supply a durable destination fencing epoch.
+Jobs that require exclusive external effects need protection at their destination; do not treat the Boolean callback as such protection.
+
+Complete shutdown and loss of all cluster state starts a fresh election on the next deployment, with no retained history.
+Do not clear or recreate the coordination map while old participants may still execute work: after record loss, a contender cannot
+recover an unknown previous owner's timeout or prove that another partition has stopped. This API does not provide safe automatic
+recovery from arbitrary shared-state loss or independently bootstrapped partitions.
+There is no durable vote/log recovery, replicated application state, or Raft membership protocol in this API.
+
+Do not mix this implementation with the older lock/message implementation during a rolling upgrade.
+They arbitrate through different mechanisms and could both announce leadership.
+Stop the old group and its owned work before starting the replacement; then ordinary restarts use the new incarnation/cleanup behavior.
+This is a one-time protocol migration, not a new storage requirement for subsequent deployments.
+
+== Validation
+
+Public-API tests exercise simultaneous contenders, healthy-owner stability, independent groups, stop/restart and context ownership.
+Fault-injected shared-map tests cover operation failure, stalled/delayed renewal, late claims and cleanup, callback reentrancy,
+startup failure, conflicting timing options and malformed state.
+Concurrent lifecycle stress also checks that stopped runs retain no periodic timers, and callback restart/failure tests check
+that an old subscriber exception cannot stop its replacement run.
+These run on the local Vert.x asynchronous map and do not certify a particular cluster provider's partition behavior.
+
+=== Optional real-cluster integration tests
+
+Run `mvn -Pcluster-tests verify` on Java 21 to add the real-cluster tests to normal verification.
+For a focused run, use:
+
+[source,shell]
+----
+mvn -Pcluster-tests \
+  -Dtest=LeaderConsensusTest,LeaderConsensusRegressionTest,LeaderConsensusOptionsTest \
+  verify
+----
+
+The profile adds a test-scoped `vertx-hazelcast` dependency matching the project's Vert.x version, and compiles
+`src/cluster-test/java`. Failsafe runs the integration tests during `verify`. The default build and production library
+have no Hazelcast dependency. The cluster-election CI job runs the focused command and gates artifact publishing.
+
+The tests use three independently clustered Vert.x instances with embedded Hazelcast, random loopback ports,
+isolated cluster names and no configured persistence. No external cluster or storage service is required.
+They check one owner across runtimes, separate group failover, abrupt provider-member termination while its Vert.x instance
+remains alive, admission of a replacement with a new node identity, and fresh election after complete cluster shutdown/restart.
+Resources are closed after each test, including on failure.
+
+`LeaderConsensusProcessIT` additionally launches three independent JVMs. It forcibly kills the owner process and checks
+failover and replacement admission without a persistent identity. A second case stops the isolated owner's Hazelcast TCP
+networking while leaving its JVM, Vert.x instance and member engine running. The test-only fault control uses internal
+Hazelcast APIs and is isolated to the pinned provider fixture, with no production fault-control API or host firewall changes.
+
+For that isolation case only, the fixture configures read/write split-brain protection on the coordination map with a minimum
+of two visible members and short test-only merge intervals. Once the provider detects the minority and rejects map operations,
+the test checks local demotion and rejection of an explicit minority map read, then restores networking and checks cluster
+reconvergence and fresh readiness. All child JVMs are forcibly cleaned up even if an assertion fails.
+The ordinary member/restart tests do not require this optional provider policy.
+
+The stalled-network experiment can leave all three members in separate views, so every member rejects coordination operations
+and no leader is ready. This is fail-closed behavior with a service interruption, not continuous majority-side availability.
+Recovery depends on restoring connectivity and the provider's merge/rejoin behavior; the library cannot repair its membership views.
+
+These checks validate the specified faults and provider configuration, not every partition schedule or deployment.
+The isolation assertion applies after the provider detects the split. It does not promise instantaneous detection, rule out
+all transient overlap during detection, or establish split-brain safety for arbitrary Hazelcast or other provider configurations.
+Member-count protection itself is not a durable fencing mechanism or a replacement for Raft consensus.
+
+== References
+
+* https://vertx.io/docs/vertx-core/java/#_shared_data[Vert.x shared data and cluster-manager-dependent behavior].

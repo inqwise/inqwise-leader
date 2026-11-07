@@ -1,279 +1,140 @@
 package com.inqwise.leader;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import static org.junit.jupiter.api.Assertions.*;
+import static com.inqwise.leader.VertxRaftStoreTest.await;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.DisplayName;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.BooleanSupplier;
+
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
 
-import io.vertx.core.AbstractVerticle;
-import io.vertx.core.DeploymentOptions;
+import io.vertx.core.Context;
+import io.vertx.core.Future;
+import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
-import io.vertx.core.shareddata.Lock;
-import io.vertx.junit5.Checkpoint;
-import io.vertx.junit5.VertxExtension;
-import io.vertx.junit5.VertxTestContext;
 
-@ExtendWith(VertxExtension.class)
 class LeaderConsensusTest {
-	private static final String GROUP = "test_group";
-	private static final Logger logger = LogManager.getLogger(LeaderConsensusTest.class);
-	
-	@BeforeEach
-	void setUp(Vertx vertx) throws Exception {
-	}
-	
-	@Test
-	@DisplayName("test approvals")
-	void testApprovals(Vertx vertx, VertxTestContext testContext) {
-		logger.debug("testApprovals");
-		
-		var options = LeaderConsensusOptions.builderFrom(new LeaderConsensusOptions()).withLeaderCycleMsgTime(100l).build();
-		
-		LeaderConsensus l1 = new LeaderConsensus(GROUP, vertx, options, "l1");
-		LeaderConsensus l2 = new LeaderConsensus(GROUP, vertx, options, "l2");
-		LeaderConsensus l3 = new LeaderConsensus(GROUP, vertx, options, "l3");
-		AtomicInteger counter = new AtomicInteger();
-		vertx.deployVerticle(new AbstractVerticle() {
-			@Override
-			public void start() throws Exception {
-				l1.onLeaderChange(leader -> {
-					if(counter.incrementAndGet() != 1) {
-						testContext.failNow("counter not equal 1");
-					} else {
-						if(leader) {
-							vertx.setTimer(1000l, res -> {
-								try {
-									Assertions.assertTrue(l1.getIsLeader());
-									Assertions.assertFalse(l2.getIsLeader());
-									Assertions.assertFalse(l3.getIsLeader());
-									Assertions.assertTrue(l1.getApprovalCounter().intValue() == 2);
-									Assertions.assertTrue(l1.getRefusalCounter().intValue() == 0);
-									testContext.completeNow();
-								} catch (Throwable e) {
-									testContext.failNow(e);
-								}
-							});
-						}
-					}
-				});
-				
-				l2.onLeaderChange(leader -> {
-					testContext.failNow("not supposed to be leader");
-				});
-				
-				l3.onLeaderChange(leader -> {
-					testContext.failNow("not supposed to be leader");
-				});
-				
-				l1.start();
-				vertx.setTimer(500l, t -> {
-					l2.start();
-				});
-				vertx.setTimer(1000l, t -> {
-					l3.start();
-				});
-			}
-			
-			@Override
-			public void stop() throws Exception {
-				l1.stop();
-				l2.stop();
-				l3.stop();
-			}
-		}, new DeploymentOptions());		
-	}
-	
-	
-	@Test
-	@DisplayName("test leaders")
-	void testLeaders(Vertx vertx, VertxTestContext testContext) {
-		logger.debug("testLeaders");
-		
-		var options = LeaderConsensusOptions.builderFrom(new LeaderConsensusOptions()).withLeaderCycleMsgTime(100l).build();
-		
-		LeaderConsensus l1 = new LeaderConsensus(GROUP, vertx, options, "l1");
-		LeaderConsensus l2 = new LeaderConsensus(GROUP, vertx, options, "l2");
-		AtomicInteger counterL1 = new AtomicInteger();
-		AtomicInteger counterL2 = new AtomicInteger();
-		vertx.deployVerticle(new AbstractVerticle() {
-			@Override
-			public void start() throws Exception {
-				l1.onLeaderChange(leader -> {
-					if(leader) {
-						counterL1.incrementAndGet();
-						vertx.setTimer(1000, id -> {
-							l1.stop();
-						});
-					}
-				});
-				
-				l2.onLeaderChange(leader -> {
-					if(leader) {
-						counterL2.incrementAndGet();
-						vertx.setTimer(1000, id1 -> {
-							l1.start();
-							
-							vertx.setTimer(1000, id2 -> {
-								try {
-									Assertions.assertTrue(leader);
-									Assertions.assertFalse(l1.getIsLeader());
-									Assertions.assertEquals(1, counterL1.get());
-									Assertions.assertEquals(1, counterL2.get());
-									testContext.completeNow();
-								} catch (Throwable t) {
-									testContext.failNow(t);
-								}
-							});
-						});
-					}
-				});
-				
-				l1.start();
-				
-				vertx.setTimer(500l, t -> {
-					l2.start();
-				});
-			}
-			
-			@Override
-			public void stop() throws Exception {
-				l1.stop();
-				l2.stop();
-			}
-		}, new DeploymentOptions());		
+	final Vertx vertx = Vertx.vertx();
+	final List<LeaderConsensus> nodes = new ArrayList<>();
+
+	static LeaderConsensusOptions options() {
+		return LeaderConsensusOptions.builder().withPendingToLeaderMsgTime(180L)
+			.withLeaderCycleMsgTime(30L).build();
 	}
 
-	@Test
-	@DisplayName("public constructor creates random id and stop releases resources")
-	void testPublicConstructorAndStop(Vertx vertx, VertxTestContext context) throws Exception {
-		var options = LeaderConsensusOptions.builder().withLeaderCycleMsgTime(50L).withPendingToLeaderMsgTime(50L).build();
-		LeaderConsensus consensus = new LeaderConsensus("cleanup_group", vertx, options);
+	LeaderConsensus node(String group) {
+		var node = new LeaderConsensus(group, vertx, options());
+		nodes.add(node);
+		return node;
+	}
 
-		Field idField = LeaderConsensus.class.getDeclaredField("id");
-		idField.setAccessible(true);
-		String generatedId = (String) idField.get(consensus);
-		context.verify(() -> Assertions.assertNotNull(generatedId));
+	@AfterEach void shutdown() throws Exception {
+		nodes.forEach(LeaderConsensus::stop);
+		await(vertx.close());
+	}
 
-		LeaderConsensus.Keys keys = consensus.new Keys();
-		context.verify(() -> Assertions.assertNotNull(keys));
+	@Test void simultaneousContendersHaveOneOwnerAndFailOverAfterStop() throws Exception {
+		var a = node("workers"); var b = node("workers"); var c = node("workers");
+		var contenders = List.of(a, b, c);
+		contenders.forEach(LeaderConsensus::start);
+		await(until(vertx, () -> leaders(contenders) == 1));
+		await(maintain(vertx, () -> leaders(contenders) == 1, 500));
+		var previous = contenders.stream().filter(LeaderConsensus::getIsLeader).findFirst().orElseThrow();
+		previous.stop();
+		assertFalse(previous.getIsLeader(), "stop must invalidate readiness synchronously");
+		await(until(vertx, () -> leaders(contenders) == 1));
+		assertFalse(previous.getIsLeader());
+		previous.start();
+		await(maintain(vertx, () -> leaders(contenders) == 1 && !previous.getIsLeader(), 500));
+	}
 
-		RecordingLock lock = new RecordingLock();
-		setField(consensus, "leaderLock", lock);
-		setField(consensus, "leader", true);
+	@Test void lateArrivalDoesNotDisplaceAHealthyOwner() throws Exception {
+		var a = node("late"); a.start();
+		await(until(vertx, a::getIsLeader));
+		var b = node("late"); b.start();
+		await(maintain(vertx, () -> a.getIsLeader() && !b.getIsLeader(), 500));
+		assertTrue(a.getApprovalCounter() > 0);
+		assertEquals(0, a.getRefusalCounter());
+	}
 
-		invoke(consensus, "startPendingToLeaderMsgTimer");
-		invoke(consensus, "startPendingToLeaderMsgTimer");
-		invoke(consensus, "startLeaderCycleMsgTimer");
-		invoke(consensus, "startLeaderCycleMsgTimer");
+	@Test void separateGroupsElectIndependently() throws Exception {
+		var a = node("group"); var b = node("group.suffix");
+		a.start(); b.start();
+		await(until(vertx, () -> a.getIsLeader() && b.getIsLeader()));
+		a.stop();
+		await(maintain(vertx, b::getIsLeader, 300));
+	}
 
-		Long releaseTimer = vertx.setTimer(1000, id -> {});
-		setField(consensus, "releaseLockApproveTimoutTimerId", releaseTimer);
-
-		consensus.stop();
-
-		context.verify(() -> {
-			Assertions.assertFalse((Boolean) getField(consensus, "leader"));
-			Assertions.assertTrue(lock.released.get());
-			Assertions.assertNull(getField(consensus, "consumer"));
-			Assertions.assertNull(getField(consensus, "privateConsumer"));
-			Assertions.assertNull(getField(consensus, "pingLeadingTimerId"));
-			Assertions.assertNull(getField(consensus, "validateLeadingTimerId"));
-			Assertions.assertNull(getField(consensus, "releaseLockApproveTimoutTimerId"));
+	@Test void repeatedStartAndStopAreIdempotentAndCallbacksUseTheOwnerContext() throws Exception {
+		Context owner = vertx.getOrCreateContext();
+		var a = await(ContextDispatch.call(owner, () -> Future.succeededFuture(node("lifecycle"))));
+		var changes = new CopyOnWriteArrayList<Boolean>();
+		var elected = Promise.<Void>promise(); var stopped = Promise.<Void>promise();
+		a.onLeaderChange(value -> {
+			assertSame(owner, Vertx.currentContext());
+			changes.add(value);
+			if (value) elected.tryComplete(); else stopped.tryComplete();
 		});
-
-		vertx.setTimer(20, id -> context.completeNow());
+		a.start(); a.start();
+		await(elected.future());
+		a.stop(); a.stop();
+		await(stopped.future());
+		assertEquals(List.of(true, false), changes);
+		assertEquals(0, a.getApprovalCounter()); assertEquals(0, a.getRefusalCounter());
+		assertNotNull(a.new Keys());
 	}
 
-	@Test
-	@DisplayName("refusal messages demote leader and reset counters")
-	void testRefusalFlow(Vertx vertx, VertxTestContext context) throws Exception {
-		var options = LeaderConsensusOptions.builder().withLeaderCycleMsgTime(40L).withPendingToLeaderMsgTime(40L).build();
-		LeaderConsensus leaderConsensus = new LeaderConsensus(GROUP, vertx, options, "refusal-node");
-		setField(leaderConsensus, "leader", true);
+	@Test void oldUncorrelatedEventBusMessagesCannotGrantOrRevokeOwnership() throws Exception {
+		var a = node("messages"); a.start();
+		await(until(vertx, a::getIsLeader));
+		vertx.eventBus().publish("messages", new JsonObject()
+			.put(LeaderConsensus.Keys.ADDRESS_UUID, "old-participant")
+			.put(LeaderConsensus.Keys.IS_LEADER, true).put(LeaderConsensus.Keys.IS_ACKNOLEDGE, false));
+		vertx.eventBus().publish("messages", "malformed old traffic");
+		await(maintain(vertx, a::getIsLeader, 300));
+	}
 
-		Checkpoint refusalSent = context.checkpoint();
-		Checkpoint refusalHandled = context.checkpoint();
-		RecordingLock lock = new RecordingLock();
-		leaderConsensus.onLeaderChange(leader -> {
-			if (!leader) {
-				context.verify(() -> {
-					Assertions.assertFalse(leaderConsensus.getIsLeader());
-					Assertions.assertEquals(0, leaderConsensus.getApprovalCounter());
-					Assertions.assertEquals(0, leaderConsensus.getRefusalCounter());
-					Assertions.assertTrue(lock.released.get());
-					leaderConsensus.stop();
-					refusalHandled.flag();
-				});
+	@Test void identicalDiagnosticIdsStillHaveIndependentRunIdentities() throws Exception {
+		var a = new LeaderConsensus("ids", vertx, options(), "same-id");
+		var b = new LeaderConsensus("ids", vertx, options(), "same-id");
+		nodes.add(a); nodes.add(b); a.start(); b.start();
+		await(until(vertx, () -> leaders(List.of(a, b)) == 1));
+		await(maintain(vertx, () -> leaders(List.of(a, b)) == 1, 400));
+	}
+
+	static long leaders(List<LeaderConsensus> nodes) {
+		return nodes.stream().filter(LeaderConsensus::getIsLeader).count();
+	}
+
+	static Future<Void> until(Vertx vertx, BooleanSupplier condition) {
+		return check(vertx, condition, 5000, false);
+	}
+
+	static Future<Void> maintain(Vertx vertx, BooleanSupplier condition, long millis) {
+		return check(vertx, condition, millis, true);
+	}
+
+	private static Future<Void> check(Vertx vertx, BooleanSupplier condition, long millis, boolean maintain) {
+		var result = Promise.<Void>promise();
+		long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(millis);
+		class Poll implements Runnable {
+			public void run() {
+				try {
+					boolean satisfied = condition.getAsBoolean();
+					if (maintain && !satisfied) result.tryFail(new AssertionError("Condition became false"));
+					else if (!maintain && satisfied) result.tryComplete();
+					else if (System.nanoTime() >= deadline) {
+						if (maintain) result.tryComplete();
+						else result.tryFail(new AssertionError("Condition did not become true"));
+					} else vertx.setTimer(10, ignored -> run());
+				} catch (Throwable e) { result.tryFail(e); }
 			}
-		});
-
-		vertx.eventBus().consumer(GROUP + ".competitor", msg -> context.verify(() -> {
-			JsonObject body = (JsonObject) msg.body();
-			Assertions.assertFalse(body.getBoolean(LeaderConsensus.Keys.IS_ACKNOLEDGE));
-			refusalSent.flag();
-		}));
-
-		leaderConsensus.start();
-
-		vertx.setTimer(30, id -> {
-			try {
-				Long timerId = vertx.setTimer(1000, ignore -> {});
-				setField(leaderConsensus, "releaseLockApproveTimoutTimerId", timerId);
-				setField(leaderConsensus, "validateLeadingTimerId", vertx.setTimer(1000, ignore -> {}));
-				setField(leaderConsensus, "leaderLock", lock);
-				setField(leaderConsensus, "isPending", false);
-
-				JsonObject competitorClaim = new JsonObject()
-					.put(LeaderConsensus.Keys.ADDRESS_UUID, "competitor")
-					.put(LeaderConsensus.Keys.IS_LEADER, true);
-				vertx.eventBus().publish(GROUP, competitorClaim);
-
-				JsonObject refusal = new JsonObject()
-					.put(LeaderConsensus.Keys.ADDRESS_UUID, "competitor")
-					.put(LeaderConsensus.Keys.IS_LEADER, true)
-					.put(LeaderConsensus.Keys.IS_ACKNOLEDGE, false);
-				vertx.eventBus().send(GROUP + ".refusal-node", refusal);
-
-			} catch (Exception e) {
-				context.failNow(e);
-			}
-		});
-	}
-
-	private static Object getField(LeaderConsensus consensus, String name) throws Exception {
-		Field field = LeaderConsensus.class.getDeclaredField(name);
-		field.setAccessible(true);
-		return field.get(consensus);
-	}
-
-	private static void setField(LeaderConsensus consensus, String name, Object value) throws Exception {
-		Field field = LeaderConsensus.class.getDeclaredField(name);
-		field.setAccessible(true);
-		field.set(consensus, value);
-	}
-
-	private static void invoke(LeaderConsensus consensus, String name) throws Exception {
-		Method method = LeaderConsensus.class.getDeclaredMethod(name);
-		method.setAccessible(true);
-		method.invoke(consensus);
-	}
-
-	private static final class RecordingLock implements Lock {
-		private final AtomicBoolean released = new AtomicBoolean(false);
-
-		@Override
-		public void release() {
-			released.set(true);
 		}
+		vertx.runOnContext(ignored -> new Poll().run());
+		return result.future();
 	}
-
 }

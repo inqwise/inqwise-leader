@@ -54,6 +54,35 @@ jobs:
           fail_ci_if_error: false
           verbose: true
 
+  cluster-election:
+    name: Cluster election on JDK 21
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Test independent clustered Vert.x instances
+        run: >-
+          mvn -Pcluster-tests
+          -Dtest=LeaderConsensusTest,LeaderConsensusRegressionTest,LeaderConsensusOptionsTest
+          verify -B
+
+      - name: Upload cluster test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-election-reports
+          path: target/failsafe-reports/
+          retention-days: 30
+
   code-quality:
     name: Code Quality Analysis
     runs-on: ubuntu-latest
@@ -84,7 +113,7 @@ jobs:
   build-and-publish:
     name: Build and Publish
     runs-on: ubuntu-latest
-    needs: [test, code-quality]
+    needs: [test, code-quality, cluster-election]
     if: github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
 
     steps:

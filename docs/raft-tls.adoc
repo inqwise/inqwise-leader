@@ -75,7 +75,7 @@ link:https://docs.openssl.org/3.0/man1/openssl-x509/[x509] references for comman
 
 == Deploying on separate hosts
 
-The Java TLS options in the link:../README.adoc#raft-quick-start[README] stay the same; replace the certificate paths and CA.
+The Java TLS options in the link:leader-coordinator.adoc#raft-quick-start[coordinator usage guide] stay the same; replace the certificate paths and CA.
 
 * Issue a distinct private key and leaf certificate for each persisted node ID, usable for both server and client authentication.
 * Include `urn:inqwise:leader:node:<node-id>` as a URI SAN. A certificate's Common Name alone is insufficient.
