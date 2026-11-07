@@ -8,50 +8,441 @@ image:https://snyk.io/test/github/inqwise/inqwise-leader/badge.svg[Snyk Security
 image:https://img.shields.io/maven-central/v/com.inqwise/inqwise-leader.svg?label=Maven%20Central[Maven Central, link=https://search.maven.org/search?q=g:%22com.inqwise%22%20AND%20a:%22inqwise-leader%22]
 image:https://img.shields.io/badge/License-MIT-yellow.svg[License: MIT, link=https://opensource.org/licenses/MIT]
 image:https://img.shields.io/badge/Java-21%2B-blue.svg[Java Version, link=https://openjdk.java.net/projects/jdk/21/]
+image:https://hub.xerj.org/contributors/glassfox/badge.svg[XERJ Corpus Hub contributor,link=https://hub.xerj.org/contributors/glassfox]
 
-Leader Election for Vert.x Clusters using the Raft Consensus Algorithm
+Leader coordination for Vert.x applications
 
 == Purpose
 
-The Inqwise-Leader project provides an implementation of leader election for Vert.x clusters using the Raft Consensus Algorithm.
-It ensures consistent and reliable leader election in distributed environments, enabling scenarios where exactly one node in the cluster must perform scheduled or critical operations.
+Inqwise-Leader provides the existing `LeaderConsensus` API and an opt-in `LeaderCoordinator` runtime using Raft.
+The coordinator persists consensus state, manages voting membership and reports when the local node is ready for leader work.
+Exclusive external side effects require the destination to enforce fencing; leadership alone does not cancel work already in flight.
 
 == Use Cases
 
-* Running exactly one scheduled process in a Vert.x cluster.
-* Ensuring singleton resource access across cluster nodes.
-* Coordinating cluster-wide tasks reliably.
-* Maintaining failover resilience when a leader node goes offline.
+* Scheduling work on the currently ready leader.
+* Coordinating singleton operations with destination-enforced fencing.
+* Managing voting membership as nodes join and leave.
+* Failing over while a voter quorum remains available.
 
 == How It Works
 
-The implementation follows the principles of the Raft Consensus Algorithm (https://raft.github.io/[Raft Website]):
+The workspace `LeaderCoordinator` runtime follows the https://raft.github.io/[Raft Consensus Algorithm]:
 
-. Leader Election: Nodes in the Vert.x cluster elect one node as the leader.
-. Log Replication: The leader communicates tasks or commands to follower nodes.
-. Consistency and Fault Tolerance: Ensures cluster reliability and consistency even during node failures.
+. Persistent voters elect a leader and replicate coordination metadata and membership changes.
+. Local readiness requires a durable current-term commit and recent quorum responses.
+. Applications start and stop leader work through readiness handlers, and fence external mutations at their destinations.
+
+The library does not automatically replicate application jobs. The legacy API is documented separately below.
 
 == Key Features
 
-* Reliable Leader Election: Guarantees that only one node acts as a leader at any time.
-* Automatic Failover: Seamless recovery when the leader node fails.
-* Lightweight Integration: Optimized for use in Vert.x applications.
-* Extensible Design: Easily adapt to various cluster architectures.
+* Persistent Raft state and automatic voter replacement.
+* Static IPv4 and SRV discovery with optional mutual TLS.
+* Vert.x futures, handlers and asynchronous filesystem operations.
+* Leadership fencing tokens and application snapshot hooks.
 
 == Installation
 
-Add the dependency to your project:
+The coordinator examples use the unreleased workspace API. Run `mvn install` in this checkout,
+then add the locally installed artifact to your application:
 
 [source,xml,subs="attributes+"]
 ----
 <dependency>
   <groupId>com.inqwise</groupId>
   <artifactId>inqwise-leader</artifactId>
-  <version>${latest.version}</version>
+  <version>2.0.0-SNAPSHOT</version>
 </dependency>
 ----
 
-== Quick Start
+[[raft-quick-start]]
+== Quick Start: LeaderCoordinator (workspace API)
+
+These examples use Java 21+ and Vert.x 5.2. Older published artifacts may not contain the coordinator API.
+The application must provide the Vert.x and logging dependencies declared as `provided` in this project's POM.
+An ordinary `Vertx.vertx()` is sufficient: this API uses direct TCP (default) or explicitly selected HTTP between nodes and does not require a Vert.x cluster manager.
+
+The first example needs no options or certificates. Plaintext trusts self-reported peer identities;
+use it in a trusted development environment. Configuration and authenticated TLS are introduced below.
+
+=== 1. One node for local development
+
+The zero-configuration factory selects one voter and makes the local node its bootstrap authority.
+It retains identity and consensus state in the group-derived `.inqwise-leader/<group-hash>/nodes/<node-a-hash>` directory.
+This node forms its own group and can lead without any peers.
+There is no failover: stopping it stops the group's work.
+
+Create the coordinator inside the verticle's `start()`
+so its operations and callbacks share the verticle's event-loop context.
+
+[source,java]
+----
+import com.inqwise.leader.LeaderCoordinator;
+import io.vertx.core.Future;
+import io.vertx.core.VerticleBase;
+
+public final class RaftWorker extends VerticleBase {
+    private LeaderCoordinator coordinator;
+    private long jobTimer = -1;
+
+    @Override
+    public Future<Void> start() {
+        coordinator = LeaderCoordinator.create(vertx);
+        coordinator.leadershipHandler(state -> {
+            if (state.leader() && jobTimer == -1) {
+                jobTimer = vertx.setPeriodic(5000, id ->
+                    System.out.println(coordinator.identity().nodeId() + ": leader job tick"));
+            } else if (!state.leader()) {
+                stopJob();
+            }
+        });
+        return coordinator.listen();
+    }
+
+    private void stopJob() {
+        if (jobTimer != -1) {
+            vertx.cancelTimer(jobTimer);
+            jobTimer = -1;
+        }
+    }
+
+    @Override
+    public Future<Void> stop() {
+        stopJob();
+        return coordinator == null ? Future.succeededFuture() : coordinator.close();
+    }
+}
+----
+
+Deploy it from your application:
+
+[source,java]
+----
+import io.vertx.core.Vertx;
+
+var vertx = Vertx.vertx();
+var deployment = vertx.deployVerticle(new RaftWorker());
+deployment.onFailure(Throwable::printStackTrace);
+----
+
+Successful deployment means local startup completed; wait for `state.leader()` before doing leader-only work.
+The handler initially observes `false`, then reports readiness after formation and election.
+Keep handlers nonblocking. Canceling the timer prevents later ticks; it does not cancel an already-running job.
+External mutations also require <<_fenced_application_writes,application fencing>>.
+
+Later, undeploy the worker and close Vert.x when the application itself is finished:
+
+[source,java]
+----
+deployment.compose(vertx::undeploy).compose(ignored -> vertx.close())
+    .onFailure(Throwable::printStackTrace);
+----
+
+=== 2. Three voters, initially on one development machine
+
+Use a separate group from the one-node example. The coordinator derives a separate directory for each node automatically.
+The target defaults to `3`; an established one-node group's target does not become three by changing local options.
+Each node needs its own identity, directory and listening port. This development example uses plaintext;
+certificates are added in scenario 5.
+
+[cols="1,1,2",options="header"]
+|===
+|Node ID |Listener |Data directory
+|node-a |127.0.0.1:8081 |.inqwise-leader/<group-hash>/nodes/<node-a-hash>
+|node-b |127.0.0.1:8082 |.inqwise-leader/<group-hash>/nodes/<node-b-hash>
+|node-c |127.0.0.1:8083 |.inqwise-leader/<group-hash>/nodes/<node-c-hash>
+|===
+
+For the remaining scenarios, configure the worker explicitly. Add these members to `RaftWorker`:
+
+[source,java]
+----
+import com.inqwise.leader.LeaderOptions;
+
+private final LeaderOptions options;
+private final int port;
+
+public RaftWorker(LeaderOptions options, int port) {
+    this.options = options;
+    this.port = port;
+}
+----
+
+In its `start()`, create the coordinator with `LeaderCoordinator.create(vertx, options)` and return
+`coordinator.listen(port)`. Keep the same leadership handler and shutdown behavior.
+This configured version replaces the no-argument worker used in the first example.
+
+Add this import and helper to your application. All three nodes use the same group, bootstrap authority and seed addresses:
+
+[source,java]
+----
+import com.inqwise.leader.DiscoveryOptions;
+
+static LeaderOptions clusterNode(String nodeId) {
+    return LeaderOptions.builder()
+        .groupName("cluster-job")
+        .nodeId(nodeId)
+        .bootstrapAuthorityId("node-a")
+        .discovery(DiscoveryOptions.staticEndpoints(
+            "127.0.0.1:8081#node-a",
+            "127.0.0.1:8082#node-b",
+            "127.0.0.1:8083#node-c"))
+        .build();
+}
+----
+
+For an in-process demonstration, deploy three workers on the same ordinary Vert.x instance:
+
+[source,java]
+----
+Future.all(
+    vertx.deployVerticle(new RaftWorker(clusterNode("node-a"), 8081)),
+    vertx.deployVerticle(new RaftWorker(clusterNode("node-b"), 8082)),
+    vertx.deployVerticle(new RaftWorker(clusterNode("node-c"), 8083))
+).onFailure(Throwable::printStackTrace);
+----
+
+Alternatively, deploy just the matching worker in each of three processes. Each process needs a stable node identity and write access to its automatically selected directory. Three processes on one machine demonstrate the protocol, but do not tolerate loss of that machine.
+
+On a fresh group, `node-a` must discover enough eligible nodes to form the complete initial three-voter set.
+Starting only one or two nodes does not finish initial formation. Once formed, a quorum is two of three;
+one voter may be unavailable, including the original authority. The authority is not a permanent leader.
+
+For a fresh larger group, set an odd `targetVoterCount`: five voters need a quorum of three,
+seven need four, and nine need five. Initial formation requires the full chosen target of eligible nodes.
+The total number of running instances can exceed the voter target; extra instances do not automatically add votes.
+
+Static endpoints use `IPv4[:port][#expectedNodeId]`. `#node-a` checks the contacted node's persisted identity;
+it does not assign an identity. An omitted discovery port always defaults to `8080`, independently of the local listening port.
+Use explicit ports here because each listener has a different port.
+
+=== 3. A node outside the original seed list
+
+After the three-node group is ready, start `node-d` with its own identity and directory:
+
+[source,java]
+----
+vertx.deployVerticle(new RaftWorker(clusterNode("node-d"), 8084))
+    .onFailure(Throwable::printStackTrace);
+----
+
+The helper deliberately still lists only `node-a`, `node-b` and `node-c`.
+You do not have to add `node-d` to those nodes' seed lists for it to join.
+It contacts the existing group; the leader checks its reported identity and reachable callback endpoint,
+commits learner admission when capacity permits, and lets it catch up.
+
+Discovery is a way to find contacts, not a declaration of the current voters.
+The persisted initial formation record (genesis) and committed membership determine the voting set.
+With three healthy voters, `node-d` normally remains a nonvoting standby learner and its application does not run the leader job.
+The default standby capacity is two learners; further nodes can remain unadmitted observers until capacity is available.
+
+If a voter leaves or fails, a caught-up learner can be promoted automatically, subject to an available quorum
+and the membership protocol. Failure replacement waits for the configured failure-observation delay (30 seconds by default);
+graceful removal can select a caught-up replacement without that failure delay.
+After promotion it can be elected and become locally ready to run the job.
+There is currently no configuration to guarantee that a particular standby will never become a voter.
+Adding nodes does not increase the persisted target from three to four or from one to three.
+
+The joining node must use the same group, bootstrap authority and transport mode, and advertise an endpoint reachable
+by existing members. With TLS, it must also trust the group's CA and present a matching certificate.
+Its local `listen()` can succeed before admission or catch-up has finished.
+Losing two of the three voters cannot be repaired merely by starting more learners: membership changes also require quorum.
+
+=== 4. Separate machines and SRV discovery
+
+For separate hosts, replace loopback addresses with actual reachable IPv4 addresses. When using TLS, issue matching certificates.
+The example addresses below are documentation placeholders. With one process per host, every node can use port `8080`.
+For a wildcard listener, provide a concrete advertised endpoint; `0.0.0.0` is not a peer address:
+
+[source,java]
+----
+var remoteNodeA = clusterNode("node-a").toBuilder()
+    .advertisedEndpoint("192.0.2.10:8080#node-a")
+    .discovery(DiscoveryOptions.srv("_inqwise-leader._tcp.example.net"))
+    .build();
+var remoteCoordinator = LeaderCoordinator.create(vertx, remoteNodeA);
+remoteCoordinator.listen(8080, "0.0.0.0").onFailure(Throwable::printStackTrace);
+----
+
+Use the corresponding identity and advertised address on each other node. All nodes query the same service name.
+An illustrative DNS zone is:
+
+[source,dns]
+----
+_inqwise-leader._tcp.example.net. 60 IN SRV 0 0 8080 node-a.example.net.
+_inqwise-leader._tcp.example.net. 60 IN SRV 0 0 8080 node-b.example.net.
+_inqwise-leader._tcp.example.net. 60 IN SRV 0 0 8080 node-c.example.net.
+node-a.example.net.              60 IN A   192.0.2.10
+node-b.example.net.              60 IN A   192.0.2.11
+node-c.example.net.              60 IN A   192.0.2.12
+----
+
+The adapter resolves SRV targets to IPv4 addresses, takes the port from each SRV record, then obtains each contacted node's
+persisted identity over the selected transport, authenticated by certificates when TLS is enabled. Identity is not encoded as `#node-id` in an SRV target.
+SRV priority and weight do not assign voting rights or select the Raft leader.
+SRV replaces the contact source; bootstrap, admission, quorum and automatic replacement behave as in the static examples.
+Removing a DNS record does not immediately remove a voter or reduce quorum. Discovery failures do not authorize a smaller quorum.
+
+=== TCP communication
+
+TCP is the default for all coordinator factories and configurations that omit `transport`.
+For TLS, use the `NetServerOptions`/`NetClientOptions` overload shown below.
+To select HTTP instead, set `options.toBuilder().transport("http").build()` (or `"transport": "http"` in JSON)
+on every peer and use `HttpServerOptions`/`HttpClientOptions` for its TLS configuration.
+
+TCP reuses the binary Raft messages and membership rules, with separate bulk connections for snapshots and larger appends.
+HTTP and TCP listeners do not interoperate; switch all peers during a coordinated maintenance stop while retaining their state.
+See link:docs/raft-tcp.adoc[TCP configuration, wire format and resource bounds] for details and TLS examples.
+
+[[raft-certificates]]
+=== 5. Certificates beyond local development
+
+To enable TLS, supply explicit options with a `nodeId` matching the certificate.
+First follow link:docs/raft-tls.adoc#local-certificates[the local certificate setup], then replace the coordinator creation
+inside `RaftWorker.start()` with the following code and add these imports:
+
+[source,java]
+----
+import io.vertx.core.http.ClientAuth;
+import io.vertx.core.net.NetClientOptions;
+import io.vertx.core.net.NetServerOptions;
+import io.vertx.core.net.PemKeyCertOptions;
+import io.vertx.core.net.PemTrustOptions;
+
+String prefix = ".local/raft-dev/tls/" + options.getNodeId();
+var keys = new PemKeyCertOptions()
+    .setKeyPath(prefix + ".key").setCertPath(prefix + ".crt");
+var trust = new PemTrustOptions().addCertPath(".local/raft-dev/tls/ca.crt");
+var serverTls = new NetServerOptions().setSsl(true).setClientAuth(ClientAuth.REQUIRED)
+    .setKeyCertOptions(keys).setTrustOptions(trust);
+var clientTls = new NetClientOptions().setSsl(true).setHostnameVerificationAlgorithm("HTTPS")
+    .setKeyCertOptions(keys).setTrustOptions(trust);
+
+coordinator = LeaderCoordinator.create(vertx, options, serverTls, clientTls);
+----
+
+The TLS construction is the same for one node, three voters and a joining learner. Configure every peer for the same mode;
+there is no automatic transport or TLS fallback. For deployment, replace development file paths and CA with credentials issued for that environment.
+Each node needs both server and client TLS credentials because it accepts and initiates peer connections.
+
+Every leaf certificate must contain the URI SAN `urn:inqwise:leader:node:<persisted-node-id>` and an IP SAN matching the
+reachable IPv4 address used by peers. For SRV, this is the resolved IPv4 address, not just the DNS target's name.
+Use a distinct private key and leaf certificate per node; provision the trusted CA certificate to all peers.
+Keep client authentication required and hostname verification enabled. A trusted certificate authenticates a node;
+it does not itself make that node a voter or a leader.
+
+See link:docs/raft-tls.adoc[Certificate setup and deployment differences] for development commands and deployment settings.
+
+=== Listener and typed discovery configuration
+
+[cols="2,3",options="header"]
+|===
+|Factory |Behavior
+|`create(vertx)` |Local plaintext TCP singleton: group `default`, identity/authority `node-a`, target one, `127.0.0.1:8080`.
+|`create(vertx, options)` |Plaintext using TCP by default, or the explicitly selected transport. The options builder still defaults to three voters.
+|`create(vertx, options, serverOptions, clientOptions)` |Uses the supplied Vert.x HTTP options. Enable TLS on both sides for verified mutual TLS.
+|===
+
+Plaintext needs no certificates and trusts self-reported peer identities. Use it for a trusted development environment.
+For authenticated peers, follow the <<raft-certificates,certificate example>> below.
+TLS mode must match on the server and client; invalid TLS settings fail startup rather than falling back to plaintext.
+
+Use `listen()` for `127.0.0.1:8080`, `listen(port)` for a different loopback port, or `listen(port, host)`
+for an explicit IPv4 binding. Ports must be 1..65535. Repeating the same binding shares startup; a different binding fails.
+`listenHost` and `listenPort` are no longer `LeaderOptions` fields; old JSON keys are rejected.
+An advertised endpoint with an omitted port inherits the selected listening port.
+
+`getDiscovery()` returns immutable `DiscoveryOptions.Static` or `DiscoveryOptions.Srv`, not a raw JSON object.
+Use `DiscoveryOptions.staticEndpoints(...)` or `DiscoveryOptions.srv(name)`; the SRV factory also accepts
+standard Vert.x `DnsClientOptions`. JSON input remains supported through `LeaderOptions.builder(json)` and
+`DiscoveryOptions.fromJson(json)`, with `toJson()` for serialization.
+
+=== Lifecycle, restart and configuration behavior
+
+[cols="1,3",options="header"]
+|===
+|Operation or condition |Meaning
+|`create(...)` |Captures the current event-loop context and returns an unopened coordinator; no storage or network I/O.
+|`listen()` succeeds |Local recovery, listener and controller started. Formation, admission and leader readiness may still be pending.
+|`state.leader()` is true |This local participant is ready for leader-only work. A follower or learner does not run that work.
+|`state.leader()` becomes false |Stop starting new leader work. Quorum loss is detected through the freshness timeout, not instantaneously.
+|`close()` |Stops this instance without requesting membership removal and retains durable state. Other members may replace it while offline.
+|`leave()` |Drains and requests committed membership removal, then closes. Requires a functioning membership protocol and may fail or time out.
+|`exceptionHandler(handler)` |Receives background and subscriber errors on the owner context. Without registration, errors use `LOG.error` with the cause; passing null restores that default.
+|Restart with the same directory |Recovers the persisted identity, cluster binding and membership history; it does not create a new group.
+|Change `targetVoterCount` locally |Supplies the target for fresh formation. Existing genesis keeps its persisted target; this is not a live resize command.
+|===
+
+Do not use `leave()` as the single-node worker's normal stop: the last voter cannot remove itself without a caught-up replacement.
+The default membership wait for leaving is 30 seconds; failure or timeout requires checking the committed outcome before retrying.
+The coordinator closes its own HTTP, store and SRV DNS resources; the application owns Vert.x.
+Handle failed operation futures as well, for example with `listen().onFailure(...)`; they remain separate from background error observation.
+Invalid local arguments and lifecycle usage report concrete exceptions such as `IllegalArgumentException` and
+`IllegalStateException` through the guarded operation's Future. `RaftUnavailableException` is a stackless expected failure
+for pending readiness, busy operations and resource pressure. It does not establish that a failed mutation was unapplied;
+check the committed outcome or use idempotency before retrying. Original I/O and application failure causes are preserved.
+
+Storage paths are automatic: configured node IDs use `.inqwise-leader/<group-hash>/nodes/<node-hash>`, independent of listening ports.
+Both hashes use SHA-256 of the configured group and node IDs; this avoids case and filename collisions across filesystems.
+Keep the working directory and its storage across restarts. Use `dataDirectory` only for a custom persistent volume,
+an existing custom layout, or explicit recovery. Do not share or clone an active node's directory between processes.
+
+Existing state in the older group-only directory is recovered when its identity matches; no files are moved.
+Without a configured node ID, the coordinator recovers the group-only identity or a single existing node directory.
+Several node directories require a node ID to select one. Corrupt or ambiguous legacy state fails startup instead of creating a new identity.
+Previously configured custom paths still require their override; removing one does not move its existing state.
+An explicit `nodeId` must match the retained identity; changing it does not rename an existing node.
+Omitting it can recover a stored identity or generate a fresh one. With TLS, matching credentials still need provisioning.
+The configured examples specify it explicitly to make bootstrap authority and certificate bindings predictable.
+
+`LeaderOptions` is immutable and publicly created only through its builder. JSON input uses `LeaderOptions.builder(json).build()`;
+use `options.toBuilder()` to derive settings for another instance. Validation occurs at `build()`;
+deriving options does not reconfigure an already-running coordinator.
+
+Coordinator operations and callbacks use the context captured at creation. Calling from another context does not change the
+caller's current context; it schedules coordinator work on the owner, where the returned future's handlers also run.
+Creating it inside the worker's `start()` keeps the example's timer and leadership state on one context.
+
+Read link:docs/raft-operations.adoc[Deployment and recovery] before running a persistent group.
+It covers maintenance, node replacement, backup limits and application fencing requirements.
+
+== Raft Design Proposal
+
+The link:docs/raft-design.adoc[Raft coordination design] describes the proposed replacement using direct HTTP transport,
+static and SRV discovery, persistent identities, and automatic voter membership.
+It includes bootstrap and recovery rules, acceptance tests, and the implementation sequence.
+The milestones document workspace implementation progress; the existing released API remains separate.
+
+The workspace includes an opt-in `VertxLeaderNode` adapter with asynchronous `VertxRaftStore` storage,
+Vert.x futures and handlers, and injected message transport. `HttpRaftTransport` adds mutual TLS identity checks
+and static/SRV discovery passes. `RaftBootstrap` adds durable cluster/genesis binding and authenticated initial
+installation, with a default target of three voters. Explicit learner catch-up and joint-consensus voter changes are
+implemented. `MembershipController` adds automatic discovery, leader-authorized learner admission and delayed voter
+replacement toward the persisted target. Durable snapshots and log compaction support lagging-member catch-up;
+DATA snapshots require application checkpoint and restore hooks. `MembershipController.leave()` drains application work,
+requests committed removal and closes resources with a bounded membership wait. `LeaderOptions` and `LeaderCoordinator`
+assemble these components from JSON or builder configuration; TLS uses standard Vert.x HTTP options.
+The existing `LeaderConsensus` API remains separate.
+
+=== Fenced application writes
+
+`coordinator.fencingToken()` returns group, persisted cluster ID and term only while the participant is ready to lead.
+The destination must atomically enforce that token with every mutation. Register a new leader's token before starting work
+there; older terms are rejected after the destination has accepted a newer term.
+See link:docs/raft-fencing.adoc[Application fencing] for the compiled Vert.x example, a transactional SQL pattern and failover tests.
+
+=== Process crash tests
+
+`mvn test -Dtest=RaftProcessTest` runs independent JVMs with real mutual TLS and persistent directories.
+It checks leader failover, minority write rejection, full-cluster snapshot recovery without the bootstrap authority,
+cross-process ownership, corruption rejection and forced termination at compaction write boundaries.
+These tests also run in the full Maven suite; JVM termination does not simulate machine power loss.
+
+== Legacy LeaderConsensus quick start
+
+This example uses the existing `LeaderConsensus` API. For the opt-in `LeaderCoordinator` API and its
+single-node, multi-node, discovery and certificate examples, see <<raft-quick-start>>.
 
 Create a verticle that starts a periodic job when it becomes leader and cancels the job when leadership is lost:
 

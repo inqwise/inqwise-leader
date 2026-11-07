@@ -1,0 +1,96 @@
+= TCP Raft Transport
+
+`TcpRaftTransport` uses Vert.x Core `NetClient`/`NetServer` directly. It needs no cluster manager, broker,
+additional communication dependency, or HTTP server. TCP is the default for coordinator configurations; HTTP requires explicit selection.
+
+== Coordinator configuration
+
+Omit `transport` to use TCP, or explicitly set it to `tcp` on every node. The same field is accepted in JSON and survives `toJson()`/`toBuilder()`.
+Listener addresses, static/SRV discovery, persistent state, bootstrap authority and membership policy retain their existing meanings.
+
+[source,java]
+----
+var tcpOptions = options; // TCP is the default when transport is omitted.
+var coordinator = LeaderCoordinator.create(vertx, tcpOptions);
+coordinator.leadershipHandler(state -> { /* start/stop leader work */ });
+coordinator.listen(8080, "127.0.0.1");
+----
+
+This example uses plaintext and trusts self-reported node identities. For mutual TLS, use the TCP options overload:
+
+[source,java]
+----
+import io.vertx.core.http.ClientAuth;
+import io.vertx.core.net.NetClientOptions;
+import io.vertx.core.net.NetServerOptions;
+
+var listener = new NetServerOptions().setSsl(true).setClientAuth(ClientAuth.REQUIRED)
+    .setKeyCertOptions(keys).setTrustOptions(trust);
+var client = new NetClientOptions().setSsl(true).setHostnameVerificationAlgorithm("HTTPS")
+    .setKeyCertOptions(keys).setTrustOptions(trust);
+var coordinator = LeaderCoordinator.create(vertx, tcpOptions, listener, client);
+----
+
+`keys` and `trust` use the same certificate configuration as link:raft-tls.adoc[the HTTP TLS setup].
+Each certificate must authorize its durable node ID and the reachable IP address. Both client and server credentials
+are validated before coordinator participation; insecure TLS settings and mixed TLS modes are rejected.
+Custom certificate identity policies remain available through the lower-level `TcpRaftTransport` constructors.
+
+The lower-level API mirrors `HttpRaftTransport`: constructors accept a recovered identity and cluster ID;
+`forBootstrap` accepts the local `RaftBootstrap`; `listen(node::receive)` handles protocol delivery.
+Both implementations share cluster binding, discovery quarantine, bootstrap, admission and removal policy.
+
+== Wire contract
+
+TCP framing version 1 wraps the existing versioned `RaftWireCodec` payload without changing the durable store format.
+Every frame begins with a four-byte signed big-endian length, excluding the length field itself.
+The length must be between 17 and 614417 bytes (17 header bytes plus the 600 KiB payload limit).
+
+[cols="1,1,3",options="header"]
+|===
+|Field |Bytes |Meaning
+|Magic |4 |`0x49525450`
+|Version |1 |`1`
+|Kind |1 |Hello `0`, request `1`, response `2`
+|Operation |1 |Operation number below
+|Correlation ID |8 |Positive request ID, echoed in its response; hello uses zero
+|Status |2 |Unsigned dispatch outcome; hello and requests use zero
+|Payload |0..614400 |Existing bounded wire-codec body
+|===
+
+Operation IDs are fixed: identity `0`, membership `1`, bootstrap fetch `2`, bootstrap install `3`, join `4`, leave `5`,
+request vote `6`, vote response `7`, append entries `8`, append response `9`, install snapshot `10`, snapshot response `11`.
+A hello uses operation zero and an identity payload with the local node ID, group and null cluster ID.
+Both endpoints exchange exactly one hello before dispatch. TLS binds its node ID to the verified certificate;
+plaintext only validates the self-reported ID. Identity requests subsequently read the current durable cluster binding.
+
+Successful result operations return status 200 and a typed payload. Dispatch-only operations return 202 and no payload.
+Statuses 425, 429 and 503 indicate temporary unavailability; other failures retain a diagnostic protocol error.
+Transport acceptance is separate from a durable Raft acknowledgement, which travels as another protocol message.
+Late replies for expired correlation IDs are ignored. Requests are never automatically replayed by the transport.
+
+== Connections and resource bounds
+
+Connections are reused per endpoint. Snapshot and larger append messages use a separate bulk connection so their socket
+write queue does not precede heartbeat/vote traffic on the control connection. The engine continues to own retry policy.
+After an established connection closes, the next operation may reconnect immediately. Failed connection or identity-handshake
+attempts use exponential backoff (50 ms initial delay, capped at 2 seconds, plus up to 50% jitter).
+
+The runtime limits outstanding outbound and inbound operations to 64 each, with 16 per connection, 128 outbound routes,
+and 256 established/connecting sockets. Socket write queues are bounded to two maximum frames each; the global pending
+write budget is eight maximum frames. Saturated writers reject work rather than accumulating an unbounded application queue.
+Handshake, partial-frame and dispatch deadlines are five seconds. Large codec work runs on workers; timed-out work retains
+its capacity until the worker finishes. Shutdown cancels exchanges, closes sockets and drains accepted codec work.
+
+== Deployment and validation
+
+HTTP and TCP peers do not interoperate on the same listener. Switch the cluster during a coordinated maintenance stop;
+retain each node's data directory and identity. There is no automatic protocol negotiation or rolling mixed-transport migration.
+Certificates and discovery endpoints must be configured consistently across the cluster.
+
+The tests exercise TLS identity binding, protocol claims, framing fragmentation/coalescing, payload limits, deadlines,
+late replies, reconnects, overload, bulk/control isolation, real election/replication/failover, bootstrap, recovery,
+learner admission and graceful leave. The opt-in link:../benchmarks/README.md[transport benchmark] compares loopback latency, throughput and resources
+with pooled HTTP. It also documents the real-process coordinated HTTP-to-TCP migration test.
+See the link:../benchmarks/results/2026-11-03-reconnect/README.md[recorded comparison and reconnect investigation].
+Local measurements do not establish production performance; retain deployment-specific validation before tuning defaults.

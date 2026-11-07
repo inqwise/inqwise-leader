@@ -1,0 +1,95 @@
+= Raft TLS setup
+
+`LeaderCoordinator.create(vertx)` and `create(vertx, options)` use plaintext without certificates.
+Plaintext retains protocol identity checks but accepts self-reported node IDs; it does not authenticate peers.
+To enable mutual TLS, use the four-argument factory and set SSL on both TCP server and client options (`NetServerOptions`/`NetClientOptions`).
+TCP clients require `setHostnameVerificationAlgorithm("HTTPS")`. Explicit `transport("http")` configurations
+instead use `HttpServerOptions`/`HttpClientOptions` with `setVerifyHost(true)`.
+Both sides must provide a private key, leaf certificate and trusted CA.
+The leaf certificate's URI SAN binds the connection to the node's persisted identity;
+its IP SAN authenticates the IPv4 endpoint contacted by peers.
+
+[[local-certificates]]
+== Local development credentials
+
+Run these commands once in your development application's working directory, using OpenSSL with `req -addext` support.
+They create a new private development CA and four loopback-only node certificates for the README's optional TLS example.
+The `.local/raft-dev` directory is ignored by this repository's existing Git rules.
+For another application, exclude this directory from version control as well.
+Do not overwrite a CA already used by retained development nodes; provision or renew those credentials separately.
+
+[source,bash]
+----
+umask 077
+mkdir -p .local/raft-dev/tls
+
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 30 \
+  -keyout .local/raft-dev/tls/ca.key \
+  -out .local/raft-dev/tls/ca.crt \
+  -subj "/CN=inqwise-leader-local-dev-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+for node in node-a node-b node-c node-d; do
+  openssl req -new -newkey rsa:2048 -nodes -sha256 \
+    -keyout ".local/raft-dev/tls/${node}.key" \
+    -out ".local/raft-dev/tls/${node}.csr" \
+    -subj "/CN=${node}"
+
+  cat > ".local/raft-dev/tls/${node}.ext" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth,clientAuth
+subjectAltName=IP:127.0.0.1,URI:urn:inqwise:leader:node:${node}
+EOF
+
+  openssl x509 -req -sha256 -days 30 \
+    -in ".local/raft-dev/tls/${node}.csr" \
+    -CA .local/raft-dev/tls/ca.crt -CAkey .local/raft-dev/tls/ca.key \
+    -CAcreateserial -extfile ".local/raft-dev/tls/${node}.ext" \
+    -out ".local/raft-dev/tls/${node}.crt"
+done
+----
+
+When enabling TLS for a single node, only `node-a.key`, `node-a.crt` and `ca.crt` are needed at runtime.
+A three-node TLS group additionally uses the corresponding `node-b` and `node-c` files;
+a joining TLS node uses `node-d`. Each process needs only its own leaf certificate/key and the shared CA certificate.
+The CA signing key is not a runtime credential and should not be distributed to nodes.
+Do not use this development CA, these loopback certificates or the repository's public test fixtures in production.
+
+Check a generated certificate before starting:
+
+[source,bash]
+----
+openssl verify -CAfile .local/raft-dev/tls/ca.crt \
+  -purpose sslserver -verify_ip 127.0.0.1 .local/raft-dev/tls/node-a.crt
+openssl verify -CAfile .local/raft-dev/tls/ca.crt \
+  -purpose sslclient .local/raft-dev/tls/node-a.crt
+openssl x509 -in .local/raft-dev/tls/node-a.crt -noout -ext subjectAltName
+----
+
+The SAN output must include both `IP Address:127.0.0.1` and `URI:urn:inqwise:leader:node:node-a`.
+OpenSSL's chain checks do not enforce the application's URI-to-persisted-identity binding; the Raft transport does that.
+See the OpenSSL link:https://docs.openssl.org/3.0/man1/openssl-req/[req] and
+link:https://docs.openssl.org/3.0/man1/openssl-x509/[x509] references for command options.
+
+== Deploying on separate hosts
+
+The Java TLS options in the link:../README.adoc#raft-quick-start[README] stay the same; replace the certificate paths and CA.
+
+* Issue a distinct private key and leaf certificate for each persisted node ID, usable for both server and client authentication.
+* Include `urn:inqwise:leader:node:<node-id>` as a URI SAN. A certificate's Common Name alone is insufficient.
+* Include the actual IPv4 addresses that peers contact as IP SANs. SRV discovery resolves targets to IPv4;
+  a DNS SAN alone does not cover a connection made to that resolved IP.
+* Bind to a reachable address, or use `0.0.0.0` with a concrete `advertisedEndpoint`. A listener address does not grant voting rights.
+* Provision the environment's trusted CA certificate to peers. Keep client authentication required and hostname verification enabled.
+* Use durable storage for identity and membership. Coordinate certificate renewal with your deployment process;
+  live credential rotation is not exposed by the coordinator API.
+
+For example, a node persisted as `node-a` and advertised at `192.0.2.10:8080` needs the URI SAN
+`urn:inqwise:leader:node:node-a` and IP SAN `192.0.2.10`, with that placeholder replaced by the real address.
+The port is an endpoint setting, not part of the certificate's node identity.
+Changing an endpoint does not rename the persisted node; certificates must still cover the new contacted address.
+
+Authentication is a prerequisite for joining. The group's committed membership determines voting rights,
+and the leadership callback determines when the local application may begin leader work.
